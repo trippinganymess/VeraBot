@@ -923,7 +923,7 @@ async def receive_context(push: ContextPush):
                 return {
                     "accepted": True,
                     "ack_id": f"ack_{uuid.uuid4().hex[:8]}",
-                    "stored_at": datetime.utcnow().isoformat() + "Z"
+                    "stored_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
                 }
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -937,7 +937,7 @@ async def receive_context(push: ContextPush):
     return {
         "accepted": True,
         "ack_id": f"ack_{uuid.uuid4().hex[:8]}",
-        "stored_at": datetime.utcnow().isoformat() + "Z"
+        "stored_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }
 
 class TickRequest(BaseModel):
@@ -1051,11 +1051,16 @@ async def handle_reply(req: ReplyRequest):
         "rationale": "Acknowledged intent to proceed"
     }
 
+from datetime import datetime, timezone
+import time
+
+START_TIME = time.time()
+
 @app.get("/v1/healthz")
 async def healthz():
     return {
         "status": "ok",
-        "uptime_seconds": 3600,
+        "uptime_seconds": int(time.time() - START_TIME),
         "contexts_loaded": {
             k: len(v) for k, v in _context_store.items()
         }
@@ -1066,11 +1071,11 @@ async def metadata():
     return {
         "team_name": "Antigravity",
         "team_members": ["AI"],
-        "model": "gemini-3.1-flash-lite",
+        "model": "gemini-3.1-flash-lite-preview",
         "approach": "modular prompt template with suppression dedup",
         "contact_email": "hello@example.com",
         "version": "1.0.0",
-        "submitted_at": datetime.utcnow().isoformat() + "Z"
+        "submitted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }
 
 if __name__ == "__main__":

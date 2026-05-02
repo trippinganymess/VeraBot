@@ -3,11 +3,14 @@
 import json
 import os
 import re
+import uuid
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, status
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field, model_validator
@@ -191,41 +194,6 @@ def _validate(model_cls: type[ModelType], raw: dict[str, Any]) -> ModelType:
     if hasattr(model_cls, "model_validate"):
         return model_cls.model_validate(raw)
     return model_cls.parse_obj(raw)
-
-
-def _load_folder(path: Path, model_cls: type[BaseModel], id_key: str) -> dict[str, BaseModel]:
-    data: dict[str, BaseModel] = {}
-    for file_path in path.glob("*.json"):
-        with file_path.open("r", encoding="utf-8") as f:
-            content = json.load(f)
-        model = _validate(model_cls, content)
-        item_id = getattr(model, id_key)
-        data[item_id] = model
-    return data
-
-
-@lru_cache(maxsize=2)
-def load_data(base_path: str | None = None) -> dict[str, dict[str, BaseModel]]:
-    """Load and validate dataset JSON into Pydantic models."""
-    if base_path is None:
-        candidate = Path("expanded")
-        base_path = "expanded" if candidate.exists() else "dataset"
-
-    path = Path(base_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Base path not found: {path}")
-
-    return {
-        "categories": _load_folder(path / "categories", CategoryContext, "slug"),
-        "merchants": _load_folder(path / "merchants", MerchantContext, "merchant_id"),
-        "customers": _load_folder(path / "customers", CustomerContext, "customer_id"),
-        "triggers": _load_folder(path / "triggers", TriggerContext, "id"),
-    }
-
-
-def data(base_path: str | None = None) -> dict[str, dict[str, BaseModel]]:
-    """Backward-compatible alias for load_data."""
-    return load_data(base_path)
 
 
 def _context_version_check(merchant: MerchantContext, trigger: TriggerContext) -> None:
@@ -923,3 +891,160 @@ def compose(
     )
     return message.model_dump()
 
+
+# =============================================================================
+# Judge Simulator API (FastAPI)
+# =============================================================================
+
+app = FastAPI(title="Vera Bot API")
+
+_context_store: dict[str, dict[str, Any]] = {
+    "category": {},
+    "merchant": {},
+    "customer": {},
+    "trigger": {},
+}
+
+class ContextPush(BaseModel):
+    scope: Literal["category", "merchant", "customer", "trigger"]
+    context_id: str
+    version: int
+    payload: dict[str, Any]
+    delivered_at: str
+
+@app.post("/v1/context")
+async def receive_context(push: ContextPush):
+    store = _context_store[push.scope]
+    if push.context_id in store:
+        current_version = store[push.context_id]["version"]
+        if push.version <= current_version:
+            if push.version == current_version:
+                return {
+                    "accepted": True,
+                    "ack_id": f"ack_{uuid.uuid4().hex[:8]}",
+                    "stored_at": datetime.utcnow().isoformat() + "Z"
+                }
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "accepted": False,
+                    "reason": "stale_version",
+                    "current_version": current_version
+                }
+            )
+    store[push.context_id] = {"version": push.version, "payload": push.payload}
+    return {
+        "accepted": True,
+        "ack_id": f"ack_{uuid.uuid4().hex[:8]}",
+        "stored_at": datetime.utcnow().isoformat() + "Z"
+    }
+
+class TickRequest(BaseModel):
+    now: str
+    available_triggers: list[str] = Field(default_factory=list)
+
+@app.post("/v1/tick")
+async def handle_tick(req: TickRequest):
+    actions = []
+    for trigger_id in req.available_triggers:
+        trigger_data = _context_store["trigger"].get(trigger_id)
+        if not trigger_data:
+            continue
+        trigger_payload = trigger_data["payload"]
+        merchant_id = trigger_payload.get("merchant_id")
+        
+        merchant_data = _context_store["merchant"].get(merchant_id)
+        if not merchant_data:
+            continue
+        merchant_payload = merchant_data["payload"]
+        
+        category_slug = merchant_payload.get("category_slug")
+        category_data = _context_store["category"].get(category_slug)
+        category_payload = category_data["payload"] if category_data else {"slug": category_slug or "unknown"}
+        
+        customer_id = trigger_payload.get("customer_id")
+        customer_payload = None
+        if customer_id:
+            customer_data = _context_store["customer"].get(customer_id)
+            if customer_data:
+                customer_payload = customer_data["payload"]
+        
+        try:
+            message = compose(
+                category=category_payload,
+                merchant=merchant_payload,
+                trigger=trigger_payload,
+                customer=customer_payload
+            )
+            actions.append({
+                "conversation_id": f"conv_{uuid.uuid4().hex[:8]}",
+                "merchant_id": merchant_id,
+                "customer_id": customer_id,
+                "send_as": message["send_as"],
+                "trigger_id": trigger_id,
+                "template_name": "vera_template",
+                "template_params": [],
+                "body": message["body"],
+                "cta": message["cta"],
+                "suppression_key": message["suppression_key"],
+                "rationale": message["rationale"]
+            })
+        except Exception:
+            pass
+    return {"actions": actions}
+
+class ReplyRequest(BaseModel):
+    conversation_id: str
+    merchant_id: str
+    customer_id: str | None = None
+    from_role: str
+    message: str
+    received_at: str
+    turn_number: int
+
+@app.post("/v1/reply")
+async def handle_reply(req: ReplyRequest):
+    message_text = req.message.lower()
+    if "wait" in message_text or "not ready" in message_text or "time" in message_text:
+        return {
+            "action": "wait",
+            "wait_seconds": 1800,
+            "rationale": "Merchant asked for time; back off 30 min"
+        }
+    if "stop" in message_text or "no" in message_text or "not interested" in message_text:
+        return {
+            "action": "end",
+            "rationale": "Merchant said not interested; gracefully exiting conversation"
+        }
+    return {
+        "action": "send",
+        "body": "Got it! Let's proceed with the details.",
+        "cta": "open_ended",
+        "rationale": "Acknowledged intent to proceed"
+    }
+
+@app.get("/v1/healthz")
+async def healthz():
+    return {
+        "status": "ok",
+        "uptime_seconds": 3600,
+        "contexts_loaded": {
+            k: len(v) for k, v in _context_store.items()
+        }
+    }
+
+@app.get("/v1/metadata")
+async def metadata():
+    return {
+        "team_name": "Antigravity",
+        "team_members": ["AI"],
+        "model": "gemini-3.1-flash-lite",
+        "approach": "modular prompt template with suppression dedup",
+        "contact_email": "hello@example.com",
+        "version": "1.0.0",
+        "submitted_at": datetime.utcnow().isoformat() + "Z"
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)

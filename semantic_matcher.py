@@ -1,11 +1,10 @@
-"""Semantic similarity matcher using a MuRIL-based sentence transformer.
+"""Semantic similarity matcher using the BGE-M3 sentence transformer.
 
 This module provides intent and auto-reply detection by comparing incoming
 messages against curated anchor phrases using cosine similarity, rather than
-brittle regex patterns.  The underlying model is ``l3cube-pune/hindi-sentence-bert-nli``,
-a MuRIL (google/muril-base-cased) model fine-tuned on NLI data for producing
-discriminative sentence embeddings across English, Hindi, and transliterated
-Indian languages.
+brittle regex patterns.  The underlying model is ``BAAI/bge-m3``,
+a multilingual model with excellent support for English, Hindi, and transliterated
+Indian languages, producing highly discriminative sentence embeddings.
 
 Usage::
 
@@ -26,15 +25,15 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Model name — based on MuRIL, fine-tuned for sentence similarity
+# Model name — BAAI/bge-m3 for multilingual sentence similarity
 # ---------------------------------------------------------------------------
-_MODEL_NAME = "l3cube-pune/hindi-sentence-bert-nli"
+_MODEL_NAME = "BAAI/bge-m3"
 
 # ---------------------------------------------------------------------------
 # Similarity thresholds (tuned from empirical testing)
 # ---------------------------------------------------------------------------
-AUTO_REPLY_THRESHOLD = 0.60
-INTENT_TRANSITION_THRESHOLD = 0.60
+AUTO_REPLY_THRESHOLD = 0.75
+INTENT_TRANSITION_THRESHOLD = 0.65
 
 # ---------------------------------------------------------------------------
 # Anchor phrases — the semantic "centers" for each category

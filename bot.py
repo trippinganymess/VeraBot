@@ -687,6 +687,8 @@ def compose(
 
     strategy = "fallback"
     lever = "neutral"
+    benchmark: dict[str, str] = {}
+    digest: dict[str, str] | None = None
 
     if _auto_reply_detected(conversation_history):
         strategy = "auto_reply_exit"
@@ -767,7 +769,8 @@ def compose(
             cta = "open_ended"
         elif language_pref.startswith("hi"):
             body = (
-                f"Namaste {merchant_name}, context update ho gaya hai. Jab aap ready ho, bataiye."
+                f"Namaste {merchant_name}, context update ho gaya hai. "
+                "Jab aap ready ho, bataiye."
             )
             cta = "open_ended"
         else:
@@ -797,36 +800,23 @@ def compose(
     }
 
     if LLM_CLIENT:
-        prompt = f"""
-You are an expert AI assistant tasked with crafting an outbound message
-for a merchant on behalf of an AI system (Vera).
-Here is the context:
-Category Context: {category_ctx.model_dump_json()}
-Merchant Context: {merchant_ctx.model_dump_json()}
-Trigger Context: {trigger_ctx.model_dump_json()}
-
-Pre-computed constraints and strategy:
-- Strategy path chosen: {strategy}
-- Compulsion Lever: {lever}
-- Category Voice Prefix: {VOICE_PREFIX_MAP.get(category_ctx.slug, 'none')}
-- Language Preference: {language_pref}
-- Desired CTA Mode: {cta}
-- Send As Role: {send_as}
-
-Draft Body provided by rule engine: "{body}"
-Draft Rationale: "{rationale}"
-
-Task:
-Refine the provided "Draft Body" into a highly engaging, precise, and
-concise message that strictly follows the constraints.
-Keep the Voice Prefix exactly as given at the start of the message if applicable.
-If CTA mode is "yes_no", the message MUST end perfectly with a binary choice (YES or STOP).
-If language preference indicates Hindi-English code-mix, seamlessly blend both languages.
-DO NOT hallucinate any facts or prices not present in the contexts.
-Update the "Draft Rationale" to precisely explain (in 1-2 sentences)
-why this specific wording and lever were chosen.
-Return a JSON object conforming perfectly to the ComposedMessage schema.
-"""
+        jit_facts = _extract_jit_facts(
+            merchant_ctx=merchant_ctx,
+            category_ctx=category_ctx,
+            trigger_ctx=trigger_ctx,
+            customer_ctx=customer_ctx,
+            benchmark=benchmark,
+            digest=digest,
+        )
+        prompt = _build_llm_prompt(
+            lever=lever,
+            language_pref=language_pref,
+            cta=cta,
+            send_as=send_as,
+            facts=jit_facts,
+            draft_body=body,
+            draft_rationale=rationale,
+        )
         try:
             response = LLM_CLIENT.models.generate_content(
                 model="gemini-3.1-flash-lite",
@@ -839,10 +829,12 @@ Return a JSON object conforming perfectly to the ComposedMessage schema.
             )
             if response.text:
                 llm_dict = json.loads(response.text)
-                llm_dict["suppression_key"] = trigger_ctx.suppression_key
+                llm_dict["suppression_key"] = (
+                    trigger_ctx.suppression_key
+                )
                 message_dict = llm_dict
         except Exception:
-            # Fallback to deterministic rule-engine dict on LLM error
+            # Fallback to deterministic rule-engine output on LLM error
             pass
 
     message = ComposedMessage.model_validate(

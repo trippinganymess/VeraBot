@@ -481,6 +481,177 @@ def _build_rationale(
     return " ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Modular prompt template system
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """\
+You are Vera, a merchant-AI assistant on magicpin.
+You help local merchants (dentists, salons, restaurants, gyms, pharmacies) \
+grow their business via WhatsApp.
+
+Rules:
+1. Output valid JSON matching: {body, cta, send_as, rationale}.
+2. cta must be one of: "yes_no", "open_ended", "none".
+3. send_as must be one of: "vera", "merchant_on_behalf".
+4. If cta is "yes_no", the body MUST end with YES or STOP.
+5. Never fabricate facts, prices, or sources not in the input.
+6. Keep the voice prefix at the start of the body if provided.
+7. Body should be concise (2-4 sentences max).
+"""
+
+LEVER_TEMPLATES: dict[str, str] = {
+    "social_proof": """\
+Write a message using SOCIAL PROOF framing.
+Reference how peers or competitors in the merchant's area are performing.
+Use phrases like "X peers in your locality", "others in your area".
+Make the merchant curious about what others are doing.
+""",
+    "loss_aversion": """\
+Write a message using LOSS AVERSION framing.
+Highlight what the merchant is missing or at risk of losing.
+Use phrases like "missing X demand", "gap vs peer median", \
+"before this window closes".
+Create urgency without being promotional.
+""",
+    "effort_externalization": """\
+Write a message using EFFORT EXTERNALIZATION framing.
+Offer to do the work for the merchant — "I've drafted X", \
+"I can set this up", "just say YES".
+Minimize perceived effort for the merchant.
+""",
+    "neutral": """\
+Write a helpful, peer-toned update message.
+Be specific and fact-anchored but without a strong persuasion lever.
+""",
+}
+"""Lever-specific prompt fragments injected into the LLM call."""
+
+
+def _extract_jit_facts(
+    merchant_ctx: MerchantContext,
+    category_ctx: CategoryContext,
+    trigger_ctx: TriggerContext,
+    customer_ctx: CustomerContext | None,
+    benchmark: dict[str, str],
+    digest: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Extract only the facts the LLM needs — no full context dumps.
+
+    Returns a small dict of concrete, verifiable data points sourced
+    from the four context objects and the pre-computed benchmark/digest.
+    This keeps the prompt token-efficient and reduces hallucination risk.
+    """
+    facts: dict[str, Any] = {}
+
+    # Merchant identity
+    if merchant_ctx.identity:
+        facts["merchant_name"] = (
+            merchant_ctx.identity.owner_first_name
+            or merchant_ctx.identity.name
+            or "there"
+        )
+    else:
+        facts["merchant_name"] = "there"
+
+    # Performance numbers
+    if merchant_ctx.performance:
+        perf = merchant_ctx.performance
+        if perf.views is not None:
+            facts["views_30d"] = perf.views
+        if perf.ctr is not None:
+            facts["ctr"] = f"{perf.ctr * 100:.1f}%"
+        if perf.calls is not None:
+            facts["calls_30d"] = perf.calls
+
+    # Peer benchmarks
+    if benchmark:
+        facts["benchmark"] = benchmark
+
+    # Category voice
+    facts["voice_prefix"] = VOICE_PREFIX_MAP.get(
+        category_ctx.slug, ""
+    )
+    facts["category_slug"] = category_ctx.slug
+
+    # Digest anchor
+    if digest:
+        facts["digest_title"] = digest.get("title", "")
+        facts["digest_source"] = digest.get("source", "")
+        facts["digest_trial_n"] = digest.get("trial_n", "")
+
+    # Trigger metadata
+    facts["trigger_kind"] = trigger_ctx.kind
+
+    # Customer identity (for customer-facing sends)
+    if customer_ctx and customer_ctx.identity:
+        facts["customer_name"] = customer_ctx.identity.name or "there"
+
+    return facts
+
+
+def _build_llm_prompt(
+    lever: str,
+    language_pref: str,
+    cta: str,
+    send_as: str,
+    facts: dict[str, Any],
+    draft_body: str,
+    draft_rationale: str,
+) -> str:
+    """Assemble the final LLM prompt from modular template pieces.
+
+    Combines the constant SYSTEM_PROMPT, a lever-specific template
+    fragment, the JIT-extracted facts, and the rule-engine draft.
+    This avoids dumping entire context objects into the prompt.
+
+    Args:
+        lever: The compulsion lever to use for framing.
+        language_pref: Language preference string (e.g. "en", "hi-en mix").
+        cta: Desired CTA mode for the output.
+        send_as: Sender attribution role.
+        facts: Minimal fact dict from _extract_jit_facts.
+        draft_body: Rule-engine pre-composed message body.
+        draft_rationale: Rule-engine pre-composed rationale.
+
+    Returns:
+        A complete prompt string ready for the LLM.
+    """
+    lever_template = LEVER_TEMPLATES.get(lever, LEVER_TEMPLATES["neutral"])
+
+    language_instruction = ""
+    if language_pref.startswith("hi"):
+        language_instruction = (
+            "Language: Hindi-English code-mix. "
+            "Blend naturally — use Hindi particles (ji, hai, karo) "
+            "with English nouns and numbers.\n"
+        )
+    else:
+        language_instruction = "Language: English.\n"
+
+    facts_block = "\n".join(
+        f"- {key}: {value}" for key, value in facts.items()
+    )
+
+    return f"""{SYSTEM_PROMPT}
+
+{lever_template}
+
+{language_instruction}
+Constraints:
+- CTA mode: {cta}
+- Send as: {send_as}
+
+Extracted facts (use ONLY these):
+{facts_block}
+
+Draft body from rule engine: "{draft_body}"
+Draft rationale: "{draft_rationale}"
+
+Refine the draft body using the lever template and facts above.
+Return a JSON object with keys: body, cta, send_as, rationale."""
+
+
 def compose(
     category: dict[str, Any],
     merchant: dict[str, Any],

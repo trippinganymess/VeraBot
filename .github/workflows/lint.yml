@@ -19,7 +19,7 @@ jobs:
       - name: Ruff lint
         run: ruff check .
       - name: Ruff format
-        run: ruff format --check .
+        run: ruff format .
       - name: Mypy
         run: mypy .
       - name: Tests

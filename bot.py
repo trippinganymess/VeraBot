@@ -341,6 +341,50 @@ def _research_digest_anchor(
     return None
 
 
+def _select_compulsion_lever(trigger_kind: str) -> str:
+    """Map trigger kinds to a compulsion lever for Stage 4."""
+    loss_aversion = {"perf_dip", "missed_search", "dormant_with_vera"}
+    social_proof = {"milestone_reached", "review_theme_emerged", "competitor_opened"}
+    effort_externalization = {"research_digest", "curious_ask_due", "trial_followup"}
+    if any(kind in trigger_kind for kind in loss_aversion):
+        return "loss_aversion"
+    if any(kind in trigger_kind for kind in social_proof):
+        return "social_proof"
+    if any(kind in trigger_kind for kind in effort_externalization):
+        return "effort_externalization"
+    return "neutral"
+
+
+def _apply_compulsion_lever(
+    message: str,
+    lever: str,
+    language_pref: str,
+) -> str:
+    """Append a lever cue to the message body."""
+    if lever == "loss_aversion":
+        if language_pref.startswith("hi"):
+            return f"{message} Missed demand avoid karne ke liye main ek quick fix bhej du?"
+        return f"{message} Want me to share a quick fix to avoid missing demand?"
+    if lever == "social_proof":
+        if language_pref.startswith("hi"):
+            return f"{message} Aapke area ke kuch peers ne isi week yeh try kiya hai."
+        return f"{message} A few peers in your area tried this this week."
+    if lever == "effort_externalization":
+        if language_pref.startswith("hi"):
+            return f"{message} Main draft ready karke bhej sakti hoon — bas YES bol dijiye."
+        return f"{message} I can draft it for you — just say YES."
+    return message
+
+
+def _apply_voice_modulation(category: CategoryContext, message: str) -> str:
+    """Apply category-specific tone prefix for Stage 4."""
+    if category.slug == "dentists":
+        return f"Clinical note: {message}"
+    if category.slug == "salons":
+        return f"Quick tip: {message}"
+    return message
+
+
 def compose(
     category: dict[str, Any],
     merchant: dict[str, Any],
@@ -410,6 +454,7 @@ def compose(
     else:
         benchmark = _benchmark_facts(merchant_ctx, category_ctx)
         digest = _research_digest_anchor(trigger_ctx, category_ctx)
+        lever = _select_compulsion_lever(trigger_ctx.kind)
         if digest and digest.get("title"):
             if language_pref.startswith("hi"):
                 body = (
@@ -452,6 +497,10 @@ def compose(
                 "Let me know when you're ready to continue."
             )
             cta = "open_ended"
+
+        if cta == "open_ended":
+            body = _apply_compulsion_lever(body, lever, language_pref)
+        body = _apply_voice_modulation(category_ctx, body)
         if language_pref.startswith("hi"):
             body = (
                 f"Namaste {merchant_name}, context update ho gaya hai. Jab aap ready ho, bataiye."

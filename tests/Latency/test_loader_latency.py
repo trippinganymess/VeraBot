@@ -1,7 +1,7 @@
 import json
 import time
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 from bot import load_data
 
@@ -40,7 +40,9 @@ class TestLoaderLatency(unittest.TestCase):
         baseline_ms = baseline.get("avg_ms", avg_ms)
         delta_ms = avg_ms - baseline_ms
         _write_log(
-            f"latency_check avg_ms={avg_ms:.2f} baseline_ms={baseline_ms:.2f} delta_ms={delta_ms:.2f}"
+            "latency_check "
+            f"avg_ms={avg_ms:.2f} baseline_ms={baseline_ms:.2f} "
+            f"delta_ms={delta_ms:.2f}"
         )
 
         threshold_ms = baseline_ms * 1.10

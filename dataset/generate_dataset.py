@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 from pathlib import Path
 
@@ -125,7 +124,7 @@ def expand_merchants(seeds: list[dict], rnd: random.Random) -> list[dict]:
     for cat_slug in NAME_BANKS:
         existing = len(by_cat.get(cat_slug, []))
         need = 10 - existing
-        for i in range(need):
+    for _i in range(need):
             owner_first, biz_name = rnd.choice(NAME_BANKS[cat_slug])
             city = rnd.choice(list(LOCALITIES.keys()))
             locality = rnd.choice(LOCALITIES[city])
@@ -175,8 +174,9 @@ def expand_customers(seeds: list[dict], merchants: list[dict], rnd: random.Rando
     customer_names = ["Aarav", "Vivaan", "Aditya", "Vihaan", "Arjun", "Ishaan", "Reyansh", "Aryan", "Ananya", "Aadhya", "Saanvi", "Kavya", "Diya", "Ira", "Myra", "Anika", "Riya", "Tara"]
     for m in merchants:
         cur = have_per_merchant.get(m["merchant_id"], 0)
-        for i in range(max(0, target_per_merchant - cur)):
-            if next_idx > 200 + len(seeds): break
+        for _i in range(max(0, target_per_merchant - cur)):
+            if next_idx > 200 + len(seeds):
+                break
             name = rnd.choice(customer_names)
             cid = f"c_{next_idx:03d}_{name.lower()}_for_{m['merchant_id']}"
             visits = rnd.randint(1, 12)
@@ -224,12 +224,14 @@ def expand_triggers(seeds: list[dict], merchants: list[dict], customers: list[di
     ]
     for kind, source, scope, urgency in additional_kinds:
         for _ in range(5):  # 5 of each kind
-            if next_idx > 100: break
+            if next_idx > 100:
+                break
             m = rnd.choice(merchants)
             cust = None
             if scope == "customer":
                 m_customers = [c for c in customers if c["merchant_id"] == m["merchant_id"]]
-                if not m_customers: continue
+                if not m_customers:
+                    continue
                 cust = rnd.choice(m_customers)
             expanded.append({
                 "id": f"trg_{next_idx:03d}_{kind}_{m['merchant_id'][:20]}",
@@ -271,13 +273,15 @@ def write_test_pairs(out_dir: Path, triggers, rnd: random.Random):
         by_kind.setdefault(t["kind"], []).append(t)
     pairs = []
     test_id = 1
-    for kind, ts in sorted(by_kind.items()):
+    for _kind, ts in sorted(by_kind.items()):
         for t in ts[:2]:  # take up to 2 per kind
             pairs.append({"test_id": f"T{test_id:02d}", "trigger_id": t["id"],
                           "merchant_id": t["merchant_id"], "customer_id": t.get("customer_id")})
             test_id += 1
-            if len(pairs) >= 30: break
-        if len(pairs) >= 30: break
+            if len(pairs) >= 30:
+                break
+        if len(pairs) >= 30:
+            break
     with open(out_dir / "test_pairs.json", "w") as f:
         json.dump({"pairs": pairs[:30]}, f, indent=2)
 

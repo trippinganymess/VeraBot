@@ -1,93 +1,117 @@
+"""Core bot composition and context loading utilities."""
+
 import json
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional, Literal, TypeVar, Type
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
 
 class AllowExtraModel(BaseModel):
+    """Base model that permits extra fields from JSON payloads."""
+
     class Config:
+        """Pydantic configuration for permissive parsing."""
         extra = "allow"
 
 
 class PeerStats(AllowExtraModel):
-    scope: Optional[str] = None
-    avg_rating: Optional[float] = None
-    avg_review_count: Optional[int] = None
-    avg_views_30d: Optional[int] = None
-    avg_calls_30d: Optional[int] = None
-    avg_directions_30d: Optional[int] = None
-    avg_ctr: Optional[float] = None
-    avg_photos: Optional[int] = None
-    avg_post_freq_days: Optional[int] = None
-    retention_6mo_pct: Optional[float] = None
+    """Peer benchmark statistics for a category."""
+
+    scope: str | None = None
+    avg_rating: float | None = None
+    avg_review_count: int | None = None
+    avg_views_30d: int | None = None
+    avg_calls_30d: int | None = None
+    avg_directions_30d: int | None = None
+    avg_ctr: float | None = None
+    avg_photos: int | None = None
+    avg_post_freq_days: int | None = None
+    retention_6mo_pct: float | None = None
 
 
 class CategoryContext(AllowExtraModel):
+    """Category-level context used for voice and benchmarks."""
+
     slug: str
-    display_name: Optional[str] = None
-    peer_stats: Optional[PeerStats] = None
-    offer_catalog: Optional[list[Dict[str, Any]]] = None
+    display_name: str | None = None
+    peer_stats: PeerStats | None = None
+    offer_catalog: list[dict[str, Any]] | None = None
 
 
 class PerformanceSnapshot(AllowExtraModel):
-    window_days: Optional[int] = None
-    views: Optional[int] = None
-    calls: Optional[int] = None
-    directions: Optional[int] = None
-    ctr: Optional[float] = None
-    leads: Optional[int] = None
-    delta_7d: Optional[Dict[str, float]] = None
+    """Merchant performance metrics snapshot."""
+
+    window_days: int | None = None
+    views: int | None = None
+    calls: int | None = None
+    directions: int | None = None
+    ctr: float | None = None
+    leads: int | None = None
+    delta_7d: dict[str, float] | None = None
 
 
 class MerchantIdentity(AllowExtraModel):
-    name: Optional[str] = None
-    owner_first_name: Optional[str] = None
-    languages: Optional[list[str]] = None
+    """Human-facing identity details for the merchant."""
+
+    name: str | None = None
+    owner_first_name: str | None = None
+    languages: list[str] | None = None
 
 
 class MerchantContext(AllowExtraModel):
+    """Merchant-specific context including identity and performance."""
+
     merchant_id: str
     category_slug: str
-    identity: Optional[MerchantIdentity] = None
-    performance: Optional[PerformanceSnapshot] = None
+    identity: MerchantIdentity | None = None
+    performance: PerformanceSnapshot | None = None
 
 
 class CustomerIdentity(AllowExtraModel):
-    name: Optional[str] = None
-    language_pref: Optional[str] = None
+    """Customer identity and language preferences."""
+
+    name: str | None = None
+    language_pref: str | None = None
 
 
 class CustomerContext(AllowExtraModel):
+    """Customer context for merchant-on-behalf messaging."""
+
     customer_id: str
     merchant_id: str
-    identity: Optional[CustomerIdentity] = None
+    identity: CustomerIdentity | None = None
 
 
 class TriggerContext(AllowExtraModel):
+    """Trigger information driving the next message."""
+
     id: str
     scope: str
     kind: str
     source: str
-    merchant_id: Optional[str] = None
-    customer_id: Optional[str] = None
-    payload: Dict[str, Any] = Field(default_factory=dict)
-    urgency: Optional[int] = None
-    suppression_key: Optional[str] = None
-    expires_at: Optional[str] = None
+    merchant_id: str | None = None
+    customer_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    urgency: int | None = None
+    suppression_key: str | None = None
+    expires_at: str | None = None
 
 
 class ComposedMessage(BaseModel):
+    """Validated output payload for the judge harness."""
+
     body: str
     cta: Literal["yes_no", "open_ended", "none"]
     send_as: Literal["vera", "merchant_on_behalf"]
-    suppression_key: Optional[str] = None
+    suppression_key: str | None = None
     rationale: str
 
     @model_validator(mode="after")
     def enforce_cta_position(self, info):
+        """Ensure YES/STOP CTA is placed at the end when required."""
         if self.cta == "yes_no":
             if not re.search(r"\b(YES|STOP)\b\s*\.?$", self.body, flags=re.IGNORECASE):
                 raise ValueError("YES/STOP CTA must be the final sentence.")
@@ -95,6 +119,7 @@ class ComposedMessage(BaseModel):
 
     @model_validator(mode="after")
     def guard_promotional_tone(self, info):
+        """Reject promotional language for clinical categories."""
         category = None
         if info.context:
             category = info.context.get("category")
@@ -105,20 +130,30 @@ class ComposedMessage(BaseModel):
 
     @model_validator(mode="after")
     def validate_language_mix(self, info):
+        """Validate required Hindi-English code mix when specified."""
         if not info.context:
             return self
         language_pref = info.context.get("language_pref")
         if not language_pref:
             return self
         if "hi" in language_pref:
-            has_hindi = re.search(r"\b(namaste|aap|kripya|bataiye|haan|ji)\b", self.body, flags=re.IGNORECASE)
-            has_english = re.search(r"\b(hi|hello|context|ready|continue)\b", self.body, flags=re.IGNORECASE)
+            has_hindi = re.search(
+                r"\b(namaste|aap|kripya|bataiye|haan|ji)\b",
+                self.body,
+                flags=re.IGNORECASE,
+            )
+            has_english = re.search(
+                r"\b(hi|hello|context|ready|continue)\b",
+                self.body,
+                flags=re.IGNORECASE,
+            )
             if not (has_hindi and has_english):
                 raise ValueError("Expected Hindi-English code mix in body.")
         return self
 
     @model_validator(mode="after")
     def validate_referenced_facts(self, info):
+        """Validate referenced prices against available offers."""
         if not info.context:
             return self
         category = info.context.get("category")
@@ -131,7 +166,9 @@ class ComposedMessage(BaseModel):
                 offers.extend([offer.get("title", "") for offer in category.offer_catalog])
             merchant_offers = getattr(merchant, "offers", None)
             if isinstance(merchant_offers, list):
-                offers.extend([offer.get("title", "") for offer in merchant_offers if isinstance(offer, dict)])
+                offers.extend(
+                    [offer.get("title", "") for offer in merchant_offers if isinstance(offer, dict)]
+                )
             if not any(any(price in title for title in offers) for price in price_mentions):
                 raise ValueError("Price mentioned without matching offer catalog.")
         return self
@@ -140,14 +177,14 @@ class ComposedMessage(BaseModel):
 ModelType = TypeVar("ModelType", bound=BaseModel)
 
 
-def _validate(model_cls: Type[ModelType], raw: Dict[str, Any]) -> ModelType:
+def _validate(model_cls: type[ModelType], raw: dict[str, Any]) -> ModelType:
     if hasattr(model_cls, "model_validate"):
         return model_cls.model_validate(raw)
     return model_cls.parse_obj(raw)
 
 
-def _load_folder(path: Path, model_cls: type[BaseModel], id_key: str) -> Dict[str, BaseModel]:
-    data: Dict[str, BaseModel] = {}
+def _load_folder(path: Path, model_cls: type[BaseModel], id_key: str) -> dict[str, BaseModel]:
+    data: dict[str, BaseModel] = {}
     for file_path in path.glob("*.json"):
         with file_path.open("r", encoding="utf-8") as f:
             content = json.load(f)
@@ -158,7 +195,8 @@ def _load_folder(path: Path, model_cls: type[BaseModel], id_key: str) -> Dict[st
 
 
 @lru_cache(maxsize=2)
-def load_data(base_path: Optional[str] = None) -> Dict[str, Dict[str, BaseModel]]:
+def load_data(base_path: str | None = None) -> dict[str, dict[str, BaseModel]]:
+    """Load and validate dataset JSON into Pydantic models."""
     if base_path is None:
         candidate = Path("expanded")
         base_path = "expanded" if candidate.exists() else "dataset"
@@ -175,7 +213,8 @@ def load_data(base_path: Optional[str] = None) -> Dict[str, Dict[str, BaseModel]
     }
 
 
-def data(base_path: Optional[str] = None) -> Dict[str, Dict[str, BaseModel]]:
+def data(base_path: str | None = None) -> dict[str, dict[str, BaseModel]]:
+    """Backward-compatible alias for load_data."""
     return load_data(base_path)
 
 
@@ -189,13 +228,16 @@ def _context_version_check(merchant: MerchantContext, trigger: TriggerContext) -
             raise ValueError("Stale context detected; please refresh /v1/context.")
 
 
-def _determine_send_as(trigger: TriggerContext, customer: Optional[CustomerContext]) -> Literal["vera", "merchant_on_behalf"]:
+def _determine_send_as(
+    trigger: TriggerContext,
+    customer: CustomerContext | None,
+) -> Literal["vera", "merchant_on_behalf"]:
     if trigger.scope == "customer" and customer is not None:
         return "merchant_on_behalf"
     return "vera"
 
 
-def _language_pref(merchant: MerchantContext, customer: Optional[CustomerContext]) -> str:
+def _language_pref(merchant: MerchantContext, customer: CustomerContext | None) -> str:
     if customer and customer.identity and customer.identity.language_pref:
         return customer.identity.language_pref
     if merchant.identity and merchant.identity.languages:
@@ -205,16 +247,18 @@ def _language_pref(merchant: MerchantContext, customer: Optional[CustomerContext
 
 
 def compose(
-    category: Dict[str, Any],
-    merchant: Dict[str, Any],
-    trigger: Dict[str, Any],
-    customer: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    category: dict[str, Any],
+    merchant: dict[str, Any],
+    trigger: dict[str, Any],
+    customer: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Hydrate context and return a Stage 1 compliant message payload."""
     category_ctx: CategoryContext = _validate(CategoryContext, category)
     merchant_ctx: MerchantContext = _validate(MerchantContext, merchant)
     trigger_ctx: TriggerContext = _validate(TriggerContext, trigger)
-    customer_ctx: Optional[CustomerContext] = _validate(CustomerContext, customer) if customer else None
+    customer_ctx: CustomerContext | None = (
+        _validate(CustomerContext, customer) if customer else None
+    )
 
     if merchant_ctx.category_slug != category_ctx.slug:
         raise ValueError("Category slug mismatch between merchant and category contexts.")
@@ -231,15 +275,27 @@ def compose(
     if send_as == "merchant_on_behalf" and customer_ctx and customer_ctx.identity:
         customer_name = customer_ctx.identity.name or "there"
         if language_pref.startswith("hi"):
-            body = f"Namaste {customer_name}, {merchant_name} clinic se. Context update ho gaya hai. Aap kab baat karna chaahenge?"
+            body = (
+                f"Namaste {customer_name}, {merchant_name} clinic se. "
+                "Context update ho gaya hai. Aap kab baat karna chaahenge?"
+            )
         else:
-            body = f"Hi {customer_name}, this is {merchant_name}. Context is updated. When would you like to continue?"
+            body = (
+                f"Hi {customer_name}, this is {merchant_name}. "
+                "Context is updated. When would you like to continue?"
+            )
         cta = "open_ended"
     else:
         if language_pref.startswith("hi"):
-            body = f"Namaste {merchant_name}, context update ho gaya hai. Jab aap ready ho, bataiye."
+            body = (
+                f"Namaste {merchant_name}, context update ho gaya hai. "
+                "Jab aap ready ho, bataiye."
+            )
         else:
-            body = f"Hi {merchant_name}, context is updated. Let me know when you're ready to continue."
+            body = (
+                f"Hi {merchant_name}, context is updated. "
+                "Let me know when you're ready to continue."
+            )
         cta = "open_ended"
 
     message = ComposedMessage.model_validate(
@@ -248,7 +304,10 @@ def compose(
             "cta": cta,
             "send_as": send_as,
             "suppression_key": trigger_ctx.suppression_key,
-            "rationale": "Stage 1 hydration: verified category alignment and sender persona before any strategy is applied.",
+            "rationale": (
+                "Stage 1 hydration: verified category alignment and sender persona "
+                "before any strategy is applied."
+            ),
         },
         context={
             "category": category_ctx,

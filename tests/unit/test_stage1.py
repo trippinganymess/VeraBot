@@ -1,7 +1,14 @@
 import unittest
 from typing import cast
 
-from bot import CategoryContext, CustomerContext, MerchantContext, TriggerContext, compose, load_data
+from bot import (
+    CategoryContext,
+    CustomerContext,
+    MerchantContext,
+    TriggerContext,
+    compose,
+    load_data,
+)
 
 
 class TestStage1Compose(unittest.TestCase):
@@ -26,7 +33,12 @@ class TestStage1Compose(unittest.TestCase):
         customer = cast(CustomerContext, self.data["customers"][customer_id])
         merchant = cast(MerchantContext, self.data["merchants"][merchant_id])
         category = cast(CategoryContext, self.data["categories"][merchant.category_slug])
-        result = compose(category.model_dump(), merchant.model_dump(), trigger.model_dump(), customer.model_dump())
+        result = compose(
+            category.model_dump(),
+            merchant.model_dump(),
+            trigger.model_dump(),
+            customer.model_dump(),
+        )
         self.assertEqual(result["send_as"], "merchant_on_behalf")
 
     def test_category_mismatch_raises(self):

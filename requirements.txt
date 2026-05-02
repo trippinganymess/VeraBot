@@ -2,3 +2,5 @@ pydantic
 ruff
 mypy
 pre-commit
+google-genai
+python-dotenv

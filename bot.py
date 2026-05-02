@@ -40,6 +40,7 @@ class CategoryContext(AllowExtraModel):
     display_name: str | None = None
     peer_stats: PeerStats | None = None
     offer_catalog: list[dict[str, Any]] | None = None
+    digest: list[dict[str, Any]] | None = None
 
 
 class PerformanceSnapshot(AllowExtraModel):
@@ -285,9 +286,59 @@ def _intent_transition_detected(message: str | None) -> bool:
         return False
     intent_patterns = [
         r"\b(i want to join|join|sign up|onboard|let's do it|proceed)\b",
-        r"\b(judna|join karna|shuru karo|start karo|karna hai)\b",
+        r"\b(jurna|zudna|jadna|zurna|judna|join karna|shuru karo|start karo|karna hai)\b",
     ]
     return any(re.search(pattern, message, flags=re.IGNORECASE) for pattern in intent_patterns)
+
+
+def _format_pct(value: float) -> str:
+    """Format a ratio as a percent string with one decimal place."""
+    return f"{value * 100:.1f}%"
+
+
+def _benchmark_facts(
+    merchant: MerchantContext,
+    category: CategoryContext,
+) -> dict[str, str]:
+    """Extract performance facts and peer comparisons for Stage 3."""
+    facts: dict[str, str] = {}
+    perf = merchant.performance
+    peer = category.peer_stats
+    if perf and perf.views is not None:
+        facts["views"] = f"{perf.views} views"
+    if perf and perf.ctr is not None:
+        facts["ctr"] = _format_pct(perf.ctr)
+    if perf and perf.calls is not None:
+        facts["calls"] = f"{perf.calls} calls"
+    if perf and peer and perf.ctr is not None and peer.avg_ctr is not None:
+        facts["ctr_gap"] = f"{_format_pct(perf.ctr)} vs peer {_format_pct(peer.avg_ctr)}"
+    return facts
+
+
+def _research_digest_anchor(
+    trigger: TriggerContext,
+    category: CategoryContext,
+) -> dict[str, str] | None:
+    """Extract research digest metadata from trigger payload or category digest."""
+    if "research_digest" not in trigger.kind:
+        return None
+    payload_item = None
+    if isinstance(trigger.payload, dict):
+        payload_item = trigger.payload.get("top_item")
+    if payload_item:
+        return {
+            "title": payload_item.get("title", ""),
+            "source": payload_item.get("source", ""),
+            "trial_n": str(payload_item.get("trial_n", "")),
+        }
+    if category.digest:
+        first_item = category.digest[0]
+        return {
+            "title": first_item.get("title", ""),
+            "source": first_item.get("source", ""),
+            "trial_n": str(first_item.get("trial_n", "")),
+        }
+    return None
 
 
 def compose(
@@ -357,6 +408,50 @@ def compose(
             )
         cta = "open_ended"
     else:
+        benchmark = _benchmark_facts(merchant_ctx, category_ctx)
+        digest = _research_digest_anchor(trigger_ctx, category_ctx)
+        if digest and digest.get("title"):
+            if language_pref.startswith("hi"):
+                body = (
+                    f"{merchant_name}, naya research digest aaya hai: "
+                    f"{digest['title']}. "
+                    f"Source: {digest.get('source', 'N/A')}. "
+                    "Aap chahen to main 2-min summary bhej du?"
+                )
+            else:
+                body = (
+                    f"{merchant_name}, new research digest: {digest['title']}. "
+                    f"Source: {digest.get('source', 'N/A')}. "
+                    "Want a 2-minute summary?"
+                )
+            cta = "open_ended"
+        elif benchmark:
+            ctr_gap = benchmark.get("ctr_gap")
+            views = benchmark.get("views")
+            if language_pref.startswith("hi"):
+                body = (
+                    f"{merchant_name}, aapke {views or 'latest'} me CTR "
+                    f"{ctr_gap or benchmark.get('ctr', 'N/A')} hai. "
+                    "Chahein to main quick improvement plan bheju?"
+                )
+            else:
+                body = (
+                    f"{merchant_name}, your {views or 'latest'} CTR is "
+                    f"{ctr_gap or benchmark.get('ctr', 'N/A')}. "
+                    "Want a quick improvement plan?"
+                )
+            cta = "open_ended"
+        elif language_pref.startswith("hi"):
+            body = (
+                f"Namaste {merchant_name}, context update ho gaya hai. Jab aap ready ho, bataiye."
+            )
+            cta = "open_ended"
+        else:
+            body = (
+                f"Hi {merchant_name}, context is updated. "
+                "Let me know when you're ready to continue."
+            )
+            cta = "open_ended"
         if language_pref.startswith("hi"):
             body = (
                 f"Namaste {merchant_name}, context update ho gaya hai. Jab aap ready ho, bataiye."

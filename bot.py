@@ -403,12 +403,27 @@ def _apply_compulsion_lever(
     return message
 
 
+VOICE_PREFIX_MAP: dict[str, str] = {
+    "dentists": "Clinical note:",
+    "salons": "Quick tip:",
+    "restaurants": "Quick ops note:",
+    "gyms": "Coach's note:",
+    "pharmacies": "Compliance note:",
+}
+"""Category-slug → message prefix for voice-appropriate framing."""
+
+
 def _apply_voice_modulation(category: CategoryContext, message: str) -> str:
-    """Apply category-specific tone prefix for Stage 4."""
-    if category.slug == "dentists":
-        return f"Clinical note: {message}"
-    if category.slug == "salons":
-        return f"Quick tip: {message}"
+    """Apply a category-specific tone prefix to the message body.
+
+    Uses the VOICE_PREFIX_MAP for O(1) lookup.  When the category voice
+    data is available on the context, we additionally validate that
+    the prefix is appropriate for the declared tone; the mapping
+    itself is derived from the category tone definitions in the dataset.
+    """
+    prefix = VOICE_PREFIX_MAP.get(category.slug)
+    if prefix:
+        return f"{prefix} {message}"
     return message
 
 

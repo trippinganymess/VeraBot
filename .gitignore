@@ -1,8 +1,0 @@
-*.md
-!README.md
-judge_simulator.py
-logs/
-expanded/
-examples/
-.venv/
-__pycache__/

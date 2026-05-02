@@ -427,13 +427,63 @@ def _apply_voice_modulation(category: CategoryContext, message: str) -> str:
     return message
 
 
+def _build_rationale(
+    strategy: str,
+    lever: str,
+    category_slug: str,
+    trigger_kind: str,
+) -> str:
+    """Build a concise rationale explaining the composition strategy.
+
+    Args:
+        strategy: Which message-construction path was taken.
+        lever: The compulsion lever applied (or 'none').
+        category_slug: Category slug for voice reference.
+        trigger_kind: Trigger kind that drove the message.
+
+    Returns:
+        A 1-2 sentence rationale suitable for the judge harness.
+    """
+    voice_label = VOICE_PREFIX_MAP.get(category_slug, "default")
+    lever_label = lever.replace("_", " ") if lever != "neutral" else "neutral framing"
+
+    parts: list[str] = []
+    if strategy == "auto_reply_exit":
+        parts.append("Detected canned auto-reply; routed to graceful exit.")
+    elif strategy == "intent_transition":
+        parts.append("Merchant signaled explicit intent; switched to action mode.")
+    elif strategy == "customer_facing":
+        parts.append("Customer-scoped trigger; sent as merchant_on_behalf.")
+    elif strategy == "digest_anchor":
+        parts.append(
+            f"Anchored on research digest from {trigger_kind} trigger "
+            f"using {lever_label} lever."
+        )
+    elif strategy == "benchmark_anchor":
+        parts.append(
+            f"Anchored on peer-median CTR benchmark to drive curiosity "
+            f"through {lever_label}."
+        )
+    else:
+        parts.append(
+            f"Fallback path with {lever_label} lever applied."
+        )
+
+    parts.append(f"Voice: {voice_label} ({category_slug}).")
+    return " ".join(parts)
+
+
 def compose(
     category: dict[str, Any],
     merchant: dict[str, Any],
     trigger: dict[str, Any],
     customer: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Hydrate context and return a Stage 1 compliant message payload."""
+    """Hydrate context and return a composed message payload.
+
+    Implements Stages 1-4: context validation, auto-reply/intent filtering,
+    benchmark/digest anchoring, lever selection, and voice modulation.
+    """
     category_ctx: CategoryContext = _validate(CategoryContext, category)
     merchant_ctx: MerchantContext = _validate(MerchantContext, merchant)
     trigger_ctx: TriggerContext = _validate(TriggerContext, trigger)
@@ -456,7 +506,11 @@ def compose(
     conversation_history = getattr(merchant_ctx, "conversation_history", None)
     last_merchant_message = _last_merchant_message(conversation_history)
 
+    strategy = "fallback"
+    lever = "neutral"
+
     if _auto_reply_detected(conversation_history):
+        strategy = "auto_reply_exit"
         if language_pref.startswith("hi"):
             body = (
                 "Hi, lagta hai yeh auto-reply hai ji. "
@@ -469,6 +523,7 @@ def compose(
             )
         cta = "none"
     elif _intent_transition_detected(last_merchant_message):
+        strategy = "intent_transition"
         if language_pref.startswith("hi"):
             body = (
                 "Great, main aapka onboarding start kar sakti hoon. "
@@ -481,6 +536,7 @@ def compose(
             )
         cta = "yes_no"
     elif send_as == "merchant_on_behalf" and customer_ctx and customer_ctx.identity:
+        strategy = "customer_facing"
         customer_name = customer_ctx.identity.name or "there"
         if language_pref.startswith("hi"):
             body = (
@@ -498,6 +554,7 @@ def compose(
         digest = _research_digest_anchor(trigger_ctx, category_ctx)
         lever = _select_compulsion_lever(trigger_ctx.kind)
         if digest and digest.get("title"):
+            strategy = "digest_anchor"
             if language_pref.startswith("hi"):
                 body = (
                     f"{merchant_name}, naya research digest aaya hai: "
@@ -513,6 +570,7 @@ def compose(
                 )
             cta = "open_ended"
         elif benchmark:
+            strategy = "benchmark_anchor"
             ctr_gap = benchmark.get("ctr_gap")
             views = benchmark.get("views")
             if language_pref.startswith("hi"):
@@ -544,16 +602,20 @@ def compose(
             body = _apply_compulsion_lever(body, lever, language_pref)
         body = _apply_voice_modulation(category_ctx, body)
 
+    rationale = _build_rationale(
+        strategy=strategy,
+        lever=lever,
+        category_slug=category_ctx.slug,
+        trigger_kind=trigger_ctx.kind,
+    )
+
     message = ComposedMessage.model_validate(
         {
             "body": body,
             "cta": cta,
             "send_as": send_as,
             "suppression_key": trigger_ctx.suppression_key,
-            "rationale": (
-                "Stage 1 hydration: verified category alignment and sender persona "
-                "before any strategy is applied."
-            ),
+            "rationale": rationale,
         },
         context={
             "category": category_ctx,
@@ -564,3 +626,4 @@ def compose(
         },
     )
     return message.model_dump()
+

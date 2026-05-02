@@ -85,3 +85,30 @@
 - All 42 tests passed.
 - Ruff lint clean.
 
+## Final LLM Assembly and JSON Structuring
+
+### Dependency Setup
+- Added `google-genai` and `python-dotenv` to `requirements.txt` to support the Gemini API client.
+- Added a `.env` file to manage the Gemini API key, ensuring secure secret loading.
+- Ignored the `.env` file in `.gitignore` to prevent credential leaks.
+
+### Gemini API Integration
+- Initialized the Gemini client globally if an API key is present in the environment.
+- Configured the API call to use the `gemini-3.1-flash-lite` model with a temperature of `0.0` for deterministic generation.
+- Enforced strict output formatting by passing the `ComposedMessage` Pydantic model directly into the `response_schema` parameter.
+- Set the `response_mime_type` to `application/json` to ensure the generated payload matches the required contract.
+
+### Prompt Engineering and Fallback
+- Created a comprehensive prompt that provides the LLM with the structured context objects (Category, Merchant, Trigger, and Customer).
+- Passed pre-computed rule-engine outputs (strategy, lever, voice prefix, and language preference) to the prompt to constrain the generation.
+- Instructed the LLM to refine the body while maintaining required voice prefixes, code-mixing constraints, and exact CTA positioning.
+- Implemented an exception block to silently fall back to the deterministic rule-engine output if the API call fails or times out.
+
+### Rationale
+1. Passing structured data and pre-computed rules to the LLM combines the reliability of deterministic logic with the linguistic fluidity of generative models.
+2. The zero-temperature setting and strict JSON schema guarantees the output parses correctly into the `ComposedMessage` format.
+3. The fallback path guarantees system resilience and keeps the test suite green even when the API key is unavailable.
+
+### Tests executed
+- `python -m unittest discover -s tests` (PASS, 42 tests)
+

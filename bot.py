@@ -14,6 +14,7 @@ class AllowExtraModel(BaseModel):
 
     class Config:
         """Pydantic configuration for permissive parsing."""
+
         extra = "allow"
 
 
@@ -238,12 +239,55 @@ def _determine_send_as(
 
 
 def _language_pref(merchant: MerchantContext, customer: CustomerContext | None) -> str:
+    """Infer a language preference for the outgoing message."""
     if customer and customer.identity and customer.identity.language_pref:
         return customer.identity.language_pref
     if merchant.identity and merchant.identity.languages:
         if "hi" in merchant.identity.languages:
             return "hi-en mix"
     return "en"
+
+
+def _last_merchant_message(conversation_history: list[dict[str, Any]] | None) -> str | None:
+    """Return the most recent merchant-authored message from history."""
+    if not conversation_history:
+        return None
+    for entry in reversed(conversation_history):
+        if entry.get("from") == "merchant" and isinstance(entry.get("body"), str):
+            return entry["body"].strip()
+    return None
+
+
+def _auto_reply_detected(conversation_history: list[dict[str, Any]] | None) -> bool:
+    """Detect canned auto-reply patterns or repeated identical merchant messages."""
+    if not conversation_history:
+        return False
+    merchant_messages = [
+        entry.get("body", "")
+        for entry in conversation_history
+        if entry.get("from") == "merchant" and isinstance(entry.get("body"), str)
+    ]
+    if len(merchant_messages) >= 2 and merchant_messages[-1] == merchant_messages[-2]:
+        return True
+    last_message = merchant_messages[-1].lower() if merchant_messages else ""
+    canned_patterns = [
+        r"thank you for contacting",
+        r"auto[- ]reply",
+        r"we will get back",
+        r"main aapki baat",
+    ]
+    return any(re.search(pattern, last_message) for pattern in canned_patterns)
+
+
+def _intent_transition_detected(message: str | None) -> bool:
+    """Detect explicit intent to join or proceed with an action."""
+    if not message:
+        return False
+    intent_patterns = [
+        r"\b(i want to join|join|sign up|onboard|let's do it|proceed)\b",
+        r"\b(judna|join karna|shuru karo|start karo|karna hai)\b",
+    ]
+    return any(re.search(pattern, message, flags=re.IGNORECASE) for pattern in intent_patterns)
 
 
 def compose(
@@ -272,7 +316,34 @@ def compose(
         merchant_name = merchant_ctx.identity.owner_first_name or merchant_ctx.identity.name
     merchant_name = merchant_name or "there"
 
-    if send_as == "merchant_on_behalf" and customer_ctx and customer_ctx.identity:
+    conversation_history = getattr(merchant_ctx, "conversation_history", None)
+    last_merchant_message = _last_merchant_message(conversation_history)
+
+    if _auto_reply_detected(conversation_history):
+        if language_pref.startswith("hi"):
+            body = (
+                "Hi, lagta hai yeh auto-reply hai ji. "
+                "Aapke owner/manager se main direct connect kar leti hoon."
+            )
+        else:
+            body = (
+                "Hi, this looks like an auto-reply. "
+                "I'll connect directly with the owner or manager."
+            )
+        cta = "none"
+    elif _intent_transition_detected(last_merchant_message):
+        if language_pref.startswith("hi"):
+            body = (
+                "Great, main aapka onboarding start kar sakti hoon. "
+                "Proceed karne ke liye YES bol dijiye, STOP for later. STOP"
+            )
+        else:
+            body = (
+                "Great, I can start your onboarding now. "
+                "Reply YES to proceed or STOP for later. STOP"
+            )
+        cta = "yes_no"
+    elif send_as == "merchant_on_behalf" and customer_ctx and customer_ctx.identity:
         customer_name = customer_ctx.identity.name or "there"
         if language_pref.startswith("hi"):
             body = (
@@ -288,8 +359,7 @@ def compose(
     else:
         if language_pref.startswith("hi"):
             body = (
-                f"Namaste {merchant_name}, context update ho gaya hai. "
-                "Jab aap ready ho, bataiye."
+                f"Namaste {merchant_name}, context update ho gaya hai. Jab aap ready ho, bataiye."
             )
         else:
             body = (
@@ -318,4 +388,3 @@ def compose(
         },
     )
     return message.model_dump()
-

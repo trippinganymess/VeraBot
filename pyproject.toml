@@ -19,5 +19,5 @@ no_implicit_optional = true
 check_untyped_defs = true
 ignore_missing_imports = true
 
-[tool.mypy-tests.*]
+[tool.mypy."tests.*"]
 ignore_errors = true

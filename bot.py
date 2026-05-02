@@ -390,6 +390,65 @@ def _select_compulsion_lever(trigger_kind: str) -> str:
     return "neutral"
 
 
+ACTION_TRIGGERS: frozenset[str] = frozenset({
+    "recall_due",
+    "appointment_tomorrow",
+    "trial_followup",
+    "chronic_refill_due",
+    "renewal_due",
+    "unverified_gbp",
+    "winback",
+})
+"""Trigger kinds that require a binary YES/STOP CTA."""
+
+
+def _is_action_trigger(trigger_kind: str) -> bool:
+    """Return True if the trigger kind requires a binary YES/STOP CTA.
+
+    Action-oriented triggers (recall, appointment, trial followup, etc.)
+    should produce a single binary commitment rather than an open-ended ask.
+    """
+    if trigger_kind in ACTION_TRIGGERS:
+        return True
+    return any(key in trigger_kind for key in ACTION_TRIGGERS)
+
+
+def _enforce_binary_cta(body: str, language_pref: str) -> str:
+    """Append a YES/STOP binary CTA to the message body if not present.
+
+    Checks whether the body already ends with YES or STOP (case-insensitive).
+    If not, appends the appropriate CTA suffix based on language preference.
+    """
+    if re.search(
+        r"\b(YES|STOP)\b\s*\.?$", body, flags=re.IGNORECASE
+    ):
+        return body
+    if language_pref.startswith("hi"):
+        return f"{body} Reply YES to confirm, STOP to cancel. YES"
+    return f"{body} Reply YES to proceed or STOP to cancel. YES"
+
+
+_suppression_store: dict[str, str] = {}
+"""In-memory store mapping suppression_key → last sent body for dedup."""
+
+
+def _check_suppression_dedup(
+    suppression_key: str | None,
+    body: str,
+) -> bool:
+    """Check if this body was already sent for the given suppression key.
+
+    Returns True if the body is a verbatim repeat (should be suppressed).
+    Returns False if it is new or the key is None.
+    Updates the store with the new body after the check.
+    """
+    if not suppression_key:
+        return False
+    previous = _suppression_store.get(suppression_key)
+    _suppression_store[suppression_key] = body
+    return previous is not None and previous == body
+
+
 def _apply_compulsion_lever(
     message: str,
     lever: str,
@@ -784,6 +843,11 @@ def compose(
             body = _apply_compulsion_lever(body, lever, language_pref)
         body = _apply_voice_modulation(category_ctx, body)
 
+        # Binary CTA enforcement for action-oriented triggers
+        if _is_action_trigger(trigger_ctx.kind):
+            body = _enforce_binary_cta(body, language_pref)
+            cta = "yes_no"
+
     rationale = _build_rationale(
         strategy=strategy,
         lever=lever,
@@ -836,6 +900,16 @@ def compose(
         except Exception:
             # Fallback to deterministic rule-engine output on LLM error
             pass
+
+    # Anti-repetition: check if the body is a verbatim repeat
+    is_repeat = _check_suppression_dedup(
+        trigger_ctx.suppression_key,
+        message_dict["body"],
+    )
+    if is_repeat:
+        message_dict["rationale"] = (
+            f"[SUPPRESSED REPEAT] {message_dict['rationale']}"
+        )
 
     message = ComposedMessage.model_validate(
         message_dict,

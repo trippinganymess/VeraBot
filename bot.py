@@ -261,8 +261,8 @@ def _intent_transition_detected(message: str | None) -> bool:
     if not message:
         return False
     intent_patterns = [
-        r"\b(i want to join|join|sign up|onboard|let's do it|proceed)\b",
-        r"\b(jurna|zudna|jadna|zurna|judna|join karna|shuru karo|start karo|karna hai)\b",
+        r"\b(i want to join|join|sign up|onboard|let's do it|proceed|let do|do it now|let's start|let's begin|let's go|i am ready|ready|i am interested|interested|interested in this|i want this|do it|let's do|let do it now|sign me up|let's sign up|join now|onboard now|i am interested|i want this|sign up for this|let's sign up for this|let's join this|i want to join this)\b",
+        r"\b(jurna|zudna|jadna|zurna|judna|join karna|shuru karo|start karo|karna hai|shuru karna|join karna hai|sign up karna|onboard karna|bharti karna|onboarding karna|onboarding start karna|onboarding start kar|bharti kar|bahrati kar|lagao na|lagao|entry|entries|entries lagao|entry lagao|onboarding start kar do)\b",
     ]
     return any(re.search(pattern, message, flags=re.IGNORECASE) for pattern in intent_patterns)
 
@@ -849,25 +849,26 @@ def compose(
             draft_body=body,
             draft_rationale=rationale,
         )
-        try:
-            response = LLM_CLIENT.models.generate_content(
-                model="gemini-3.1-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ComposedMessage,
-                    temperature=0.0,
-                ),
-            )
-            if response.text:
-                llm_dict = json.loads(response.text)
-                llm_dict["suppression_key"] = (
-                    trigger_ctx.suppression_key
+        if os.getenv("NO_LLM") != "1":
+            try:
+                response = LLM_CLIENT.models.generate_content(
+                    model="gemini-3.1-flash-lite-preview",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=ComposedMessage,
+                        temperature=0.0,
+                    ),
                 )
-                message_dict = llm_dict
-        except Exception:
-            # Fallback to deterministic rule-engine output on LLM error
-            pass
+                if response.text:
+                    llm_dict = json.loads(response.text)
+                    llm_dict["suppression_key"] = (
+                        trigger_ctx.suppression_key
+                    )
+                    message_dict = llm_dict
+            except Exception:
+                # Fallback to deterministic rule-engine output on LLM error
+                pass
 
     # Anti-repetition: check if the body is a verbatim repeat
     is_repeat = _check_suppression_dedup(
@@ -1004,18 +1005,45 @@ class ReplyRequest(BaseModel):
 
 @app.post("/v1/reply")
 async def handle_reply(req: ReplyRequest):
+    merchant_data = _context_store["merchant"].get(req.merchant_id)
+    if merchant_data:
+        history = merchant_data["payload"].setdefault("conversation_history", [])
+        history.append({"from": req.from_role, "body": req.message})
+        
+        # Check auto-reply from 4 auto-replies
+        merchant_messages = [e.get("body", "") for e in history if e.get("from") == "merchant"]
+        if len(merchant_messages) >= 4 and len(set(merchant_messages[-4:])) == 1:
+            return {
+                "action": "end",
+                "rationale": "Auto-reply loop detected, ending conversation"
+            }
+
     message_text = req.message.lower()
+    
+    # Hostile Handling
+    if "stop" in message_text or "spam" in message_text or "not interested" in message_text or "useless" in message_text:
+        return {
+            "action": "end",
+            "rationale": "Merchant is hostile; gracefully exiting conversation"
+        }
+        
+    # Wait intent
     if "wait" in message_text or "not ready" in message_text or "time" in message_text:
         return {
             "action": "wait",
             "wait_seconds": 1800,
             "rationale": "Merchant asked for time; back off 30 min"
         }
-    if "stop" in message_text or "no" in message_text or "not interested" in message_text:
+
+    # Intent transition
+    if _intent_transition_detected(req.message):
         return {
-            "action": "end",
-            "rationale": "Merchant said not interested; gracefully exiting conversation"
+            "action": "send",
+            "body": "Got it! Let's proceed with the details.",
+            "cta": "open_ended",
+            "rationale": "Acknowledged intent to proceed"
         }
+        
     return {
         "action": "send",
         "body": "Got it! Let's proceed with the details.",

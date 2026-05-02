@@ -627,7 +627,8 @@ def compose(
 
     if LLM_CLIENT:
         prompt = f"""
-You are an expert AI assistant tasked with crafting an outbound message for a merchant on behalf of an AI system (Vera).
+You are an expert AI assistant tasked with crafting an outbound message
+for a merchant on behalf of an AI system (Vera).
 Here is the context:
 Category Context: {category_ctx.model_dump_json()}
 Merchant Context: {merchant_ctx.model_dump_json()}
@@ -645,12 +646,14 @@ Draft Body provided by rule engine: "{body}"
 Draft Rationale: "{rationale}"
 
 Task:
-Refine the provided "Draft Body" into a highly engaging, precise, and concise message that strictly follows the constraints.
+Refine the provided "Draft Body" into a highly engaging, precise, and
+concise message that strictly follows the constraints.
 Keep the Voice Prefix exactly as given at the start of the message if applicable.
 If CTA mode is "yes_no", the message MUST end perfectly with a binary choice (YES or STOP).
 If language preference indicates Hindi-English code-mix, seamlessly blend both languages.
 DO NOT hallucinate any facts or prices not present in the contexts.
-Update the "Draft Rationale" to precisely explain (in 1-2 sentences) why this specific wording and lever were chosen.
+Update the "Draft Rationale" to precisely explain (in 1-2 sentences)
+why this specific wording and lever were chosen.
 Return a JSON object conforming perfectly to the ComposedMessage schema.
 """
         try:

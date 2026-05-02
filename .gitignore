@@ -8,3 +8,4 @@ examples/
 __pycache__/
 .DS_Store
 .githooks/
+dataset/

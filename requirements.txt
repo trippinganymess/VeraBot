@@ -4,3 +4,5 @@ mypy
 pre-commit
 google-genai
 python-dotenv
+sentence-transformers
+numpy

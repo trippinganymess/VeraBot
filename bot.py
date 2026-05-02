@@ -15,6 +15,8 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field, model_validator
 
+from semantic_matcher import semantic_matcher
+
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 LLM_CLIENT = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -235,8 +237,29 @@ def _last_merchant_message(conversation_history: list[dict[str, Any]] | None) ->
     return None
 
 
+# Lightweight regex patterns kept as a fast-path for unmistakable signals.
+_AUTO_REPLY_REGEX: list[str] = [
+    r"auto[- ]?reply",
+    r"noreply@",
+    r"no-reply@",
+    r"do not reply",
+]
+
+_INTENT_REGEX: list[str] = [
+    r"\b(let'?s do it|sign me up|i want to join|proceed)\b",
+    r"\b(shuru karo|join karna|onboard karna|bharti karo)\b",
+]
+
+
 def _auto_reply_detected(conversation_history: list[dict[str, Any]] | None) -> bool:
-    """Detect canned auto-reply patterns or repeated identical merchant messages."""
+    """Detect auto-reply messages via semantic similarity (MuRIL) with regex fast-path.
+
+    Detection strategy (in order):
+    1. Repeated identical merchant messages → always auto-reply.
+    2. Regex fast-path for unmistakable canned markers (e.g. 'noreply@').
+    3. Semantic similarity against pre-computed auto-reply anchor embeddings
+       using the MuRIL-based sentence transformer.
+    """
     if not conversation_history:
         return False
     merchant_messages = [
@@ -244,27 +267,41 @@ def _auto_reply_detected(conversation_history: list[dict[str, Any]] | None) -> b
         for entry in conversation_history
         if entry.get("from") == "merchant" and isinstance(entry.get("body"), str)
     ]
+    if not merchant_messages:
+        return False
+
+    # Strategy 1: identical repeated messages
     if len(merchant_messages) >= 2 and merchant_messages[-1] == merchant_messages[-2]:
         return True
-    last_message = merchant_messages[-1].lower() if merchant_messages else ""
-    canned_patterns = [
-        r"thank you for contacting",
-        r"auto[- ]reply",
-        r"we will get back",
-        r"main aapki baat",
-    ]
-    return any(re.search(pattern, last_message) for pattern in canned_patterns)
+
+    last_message = merchant_messages[-1]
+    last_lower = last_message.lower()
+
+    # Strategy 2: regex fast-path for obvious markers
+    if any(re.search(p, last_lower) for p in _AUTO_REPLY_REGEX):
+        return True
+
+    # Strategy 3: semantic similarity via MuRIL
+    return semantic_matcher.is_auto_reply(last_message)
 
 
 def _intent_transition_detected(message: str | None) -> bool:
-    """Detect explicit intent to join or proceed with an action."""
+    """Detect explicit intent to join or proceed via semantic similarity (MuRIL).
+
+    Detection strategy (in order):
+    1. Regex fast-path for unambiguous English/Hindi keywords.
+    2. Semantic similarity against pre-computed intent anchor embeddings
+       using the MuRIL-based sentence transformer.
+    """
     if not message:
         return False
-    intent_patterns = [
-        r"\b(i want to join|join|sign up|onboard|let's do it|proceed|let do|do it now|let's start|let's begin|let's go|i am ready|ready|i am interested|interested|interested in this|i want this|do it|let's do|let do it now|sign me up|let's sign up|join now|onboard now|i am interested|i want this|sign up for this|let's sign up for this|let's join this|i want to join this)\b",
-        r"\b(jurna|zudna|jadna|zurna|judna|join karna|shuru karo|start karo|karna hai|shuru karna|join karna hai|sign up karna|onboard karna|bharti karna|onboarding karna|onboarding start karna|onboarding start kar|bharti kar|bahrati kar|lagao na|lagao|entry|entries|entries lagao|entry lagao|onboarding start kar do)\b",
-    ]
-    return any(re.search(pattern, message, flags=re.IGNORECASE) for pattern in intent_patterns)
+
+    # Strategy 1: regex fast-path
+    if any(re.search(p, message, flags=re.IGNORECASE) for p in _INTENT_REGEX):
+        return True
+
+    # Strategy 2: semantic similarity via MuRIL
+    return semantic_matcher.is_intent_transition(message)
 
 
 def _format_pct(value: float) -> str:
@@ -687,7 +724,7 @@ def compose(
 ) -> dict[str, Any]:
     """Hydrate context and return a composed message payload.
 
-    Implements Stages 1-4: context validation, auto-reply/intent filtering,
+   context validation, auto-reply/intent filtering,
     benchmark/digest anchoring, lever selection, and voice modulation.
     """
     category_ctx: CategoryContext = _validate(CategoryContext, category)

@@ -23,6 +23,11 @@ class TestDataLoader(unittest.TestCase):
         self.assertIsInstance(any_customer, CustomerContext)
         self.assertIsInstance(any_trigger, TriggerContext)
 
+    def test_load_data_cache(self):
+        data_first = load_data()
+        data_second = load_data()
+        self.assertIs(data_first, data_second)
+
 
 if __name__ == "__main__":
     unittest.main()

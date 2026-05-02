@@ -1,5 +1,6 @@
 import json
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional, Literal, TypeVar, Type
 
@@ -156,6 +157,7 @@ def _load_folder(path: Path, model_cls: type[BaseModel], id_key: str) -> Dict[st
     return data
 
 
+@lru_cache(maxsize=2)
 def load_data(base_path: Optional[str] = None) -> Dict[str, Dict[str, BaseModel]]:
     if base_path is None:
         candidate = Path("expanded")
@@ -208,6 +210,7 @@ def compose(
     trigger: Dict[str, Any],
     customer: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Hydrate context and return a Stage 1 compliant message payload."""
     category_ctx: CategoryContext = _validate(CategoryContext, category)
     merchant_ctx: MerchantContext = _validate(MerchantContext, merchant)
     trigger_ctx: TriggerContext = _validate(TriggerContext, trigger)

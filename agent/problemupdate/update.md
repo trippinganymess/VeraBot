@@ -112,3 +112,44 @@
 ### Tests executed
 - `python -m unittest discover -s tests` (PASS, 42 tests)
 
+## Modular Prompt Template System
+
+### Problem
+The initial LLM prompt dumped entire context objects (CategoryContext, MerchantContext, TriggerContext) as JSON into a single monolithic prompt. This wasted tokens on data points irrelevant to the specific trigger, increased hallucination risk by giving the model too much creative latitude, and made debugging individual levers impossible without touching the whole prompt.
+
+### Solution: Three-Layer Prompt Architecture
+
+#### SYSTEM_PROMPT (constant)
+- Defines the Vera persona and 7 strict formatting rules (JSON keys, CTA constraints, fabrication prohibition).
+- Never changes between calls — cached as a module-level constant.
+
+#### LEVER_TEMPLATES (lever-specific fragments)
+- 4 small prompt fragments (`social_proof`, `loss_aversion`, `effort_externalization`, `neutral`), each 3-4 lines, each focused on a single compulsion framing.
+- Selected via O(1) lookup using the same lever already computed by `_select_compulsion_lever`.
+
+#### _extract_jit_facts (Just-In-Time fact extractor)
+- Extracts only the verifiable data points the LLM needs: merchant name, views_30d, CTR, peer benchmark, digest title/source/trial_n, trigger kind, customer name, and voice prefix.
+- Returns a small `dict[str, Any]` (~5-10 keys) instead of full context objects (~50+ keys each).
+
+#### _build_llm_prompt (prompt assembler)
+- Concatenates SYSTEM_PROMPT + lever template + language instruction + facts block + draft body/rationale.
+- Adds language-specific instructions (Hindi-English code-mix blending rules vs. English).
+
+### Binary CTA Enforcement
+- Added `ACTION_TRIGGERS` frozenset with 7 trigger kinds (recall_due, appointment_tomorrow, trial_followup, chronic_refill_due, renewal_due, unverified_gbp, winback).
+- `_is_action_trigger()` checks membership with O(1) lookup + substring fallback for compound kinds.
+- `_enforce_binary_cta()` appends "Reply YES to proceed or STOP to cancel. YES" if the body doesn't already end with YES or STOP.
+- In `compose()`, action triggers override `cta` to `"yes_no"` after body composition.
+
+### Suppression Key Dedup
+- Added `_suppression_store` module-level dict mapping `suppression_key → last sent body`.
+- `_check_suppression_dedup()` returns True if the body is a verbatim repeat for the same key.
+- In `compose()`, repeated messages are tagged with `[SUPPRESSED REPEAT]` in the rationale field.
+
+### Tests
+- Added `tests/botResponse/test_prompt_templates.py` (23 tests across 4 classes).
+- Added `tests/botResponse/test_cta_and_suppression.py` (20 tests across 5 classes).
+
+### Tests executed
+- `ruff check .` (PASS)
+- `python -m unittest discover -s tests` (PASS, 85 tests)

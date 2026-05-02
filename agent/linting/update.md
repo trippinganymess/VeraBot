@@ -9,5 +9,5 @@
 - `ruff check .` (PASS)
 
 ### Tests executed
-- `python -m unittest discover -s tests` (PASS, 42 tests)
+- `python -m unittest discover -s tests` (PASS, 85 tests)
 

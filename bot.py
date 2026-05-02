@@ -341,17 +341,44 @@ def _research_digest_anchor(
     return None
 
 
+LEVER_MAP: dict[str, str] = {
+    # Loss aversion — best for performance dips or missed opportunities
+    "perf_dip": "loss_aversion",
+    "missed_search": "loss_aversion",
+    "dormant_with_vera": "loss_aversion",
+    "renewal_due": "loss_aversion",
+    "seasonal_acquisition_dip": "loss_aversion",
+    "winback": "loss_aversion",
+    "customer_lapsed_soft": "loss_aversion",
+    # Social proof — best for social-facing triggers or benchmarks
+    "milestone_reached": "social_proof",
+    "review_theme_emerged": "social_proof",
+    "competitor_opened": "social_proof",
+    "perf_spike": "social_proof",
+    "festival_upcoming": "social_proof",
+    # Effort externalization — best for "I've drafted X — just say go"
+    "research_digest": "effort_externalization",
+    "curious_ask_due": "effort_externalization",
+    "trial_followup": "effort_externalization",
+    "appointment_tomorrow": "effort_externalization",
+    "recall_due": "effort_externalization",
+    "chronic_refill_due": "effort_externalization",
+    "unverified_gbp": "effort_externalization",
+}
+"""O(1) trigger-kind → compulsion lever lookup table."""
+
+
 def _select_compulsion_lever(trigger_kind: str) -> str:
-    """Map trigger kinds to a compulsion lever for Stage 4."""
-    loss_aversion = {"perf_dip", "missed_search", "dormant_with_vera"}
-    social_proof = {"milestone_reached", "review_theme_emerged", "competitor_opened"}
-    effort_externalization = {"research_digest", "curious_ask_due", "trial_followup"}
-    if any(kind in trigger_kind for kind in loss_aversion):
-        return "loss_aversion"
-    if any(kind in trigger_kind for kind in social_proof):
-        return "social_proof"
-    if any(kind in trigger_kind for kind in effort_externalization):
-        return "effort_externalization"
+    """Map a trigger kind to a compulsion lever via O(1) dictionary lookup.
+
+    Falls back to substring matching for compound trigger kinds (e.g.
+    'research_digest_release'), and returns 'neutral' when no lever matches.
+    """
+    if trigger_kind in LEVER_MAP:
+        return LEVER_MAP[trigger_kind]
+    for key, lever in LEVER_MAP.items():
+        if key in trigger_kind:
+            return lever
     return "neutral"
 
 

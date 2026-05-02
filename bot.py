@@ -1,12 +1,20 @@
 """Core bot composition and context loading utilities."""
 
 import json
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field, model_validator
+
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+LLM_CLIENT = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
 class AllowExtraModel(BaseModel):
@@ -609,14 +617,62 @@ def compose(
         trigger_kind=trigger_ctx.kind,
     )
 
+    message_dict = {
+        "body": body,
+        "cta": cta,
+        "send_as": send_as,
+        "suppression_key": trigger_ctx.suppression_key,
+        "rationale": rationale,
+    }
+
+    if LLM_CLIENT:
+        prompt = f"""
+You are an expert AI assistant tasked with crafting an outbound message for a merchant on behalf of an AI system (Vera).
+Here is the context:
+Category Context: {category_ctx.model_dump_json()}
+Merchant Context: {merchant_ctx.model_dump_json()}
+Trigger Context: {trigger_ctx.model_dump_json()}
+
+Pre-computed constraints and strategy:
+- Strategy path chosen: {strategy}
+- Compulsion Lever: {lever}
+- Category Voice Prefix: {VOICE_PREFIX_MAP.get(category_ctx.slug, 'none')}
+- Language Preference: {language_pref}
+- Desired CTA Mode: {cta}
+- Send As Role: {send_as}
+
+Draft Body provided by rule engine: "{body}"
+Draft Rationale: "{rationale}"
+
+Task:
+Refine the provided "Draft Body" into a highly engaging, precise, and concise message that strictly follows the constraints.
+Keep the Voice Prefix exactly as given at the start of the message if applicable.
+If CTA mode is "yes_no", the message MUST end perfectly with a binary choice (YES or STOP).
+If language preference indicates Hindi-English code-mix, seamlessly blend both languages.
+DO NOT hallucinate any facts or prices not present in the contexts.
+Update the "Draft Rationale" to precisely explain (in 1-2 sentences) why this specific wording and lever were chosen.
+Return a JSON object conforming perfectly to the ComposedMessage schema.
+"""
+        try:
+            response = LLM_CLIENT.models.generate_content(
+                model="gemini-3.1-flash-lite",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=ComposedMessage,
+                    temperature=0.0,
+                ),
+            )
+            if response.text:
+                llm_dict = json.loads(response.text)
+                llm_dict["suppression_key"] = trigger_ctx.suppression_key
+                message_dict = llm_dict
+        except Exception:
+            # Fallback to deterministic rule-engine dict on LLM error
+            pass
+
     message = ComposedMessage.model_validate(
-        {
-            "body": body,
-            "cta": cta,
-            "send_as": send_as,
-            "suppression_key": trigger_ctx.suppression_key,
-            "rationale": rationale,
-        },
+        message_dict,
         context={
             "category": category_ctx,
             "merchant": merchant_ctx,

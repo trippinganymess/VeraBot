@@ -1,13 +1,12 @@
 import unittest
 
 from bot import (
-    LEVER_MAP,
     VOICE_PREFIX_MAP,
+    CategoryContext,
     _apply_compulsion_lever,
     _apply_voice_modulation,
     _build_rationale,
     _select_compulsion_lever,
-    CategoryContext,
     compose,
 )
 

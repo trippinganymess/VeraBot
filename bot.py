@@ -501,16 +501,6 @@ def compose(
         if cta == "open_ended":
             body = _apply_compulsion_lever(body, lever, language_pref)
         body = _apply_voice_modulation(category_ctx, body)
-        if language_pref.startswith("hi"):
-            body = (
-                f"Namaste {merchant_name}, context update ho gaya hai. Jab aap ready ho, bataiye."
-            )
-        else:
-            body = (
-                f"Hi {merchant_name}, context is updated. "
-                "Let me know when you're ready to continue."
-            )
-        cta = "open_ended"
 
     message = ComposedMessage.model_validate(
         {

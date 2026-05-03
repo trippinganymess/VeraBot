@@ -6,3 +6,6 @@ google-genai
 python-dotenv
 sentence-transformers
 numpy
+fastapi
+uvicorn
+anyio

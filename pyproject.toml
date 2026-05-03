@@ -9,8 +9,11 @@ select = ["E", "F", "I", "UP", "B", "D", "ISC"]
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["D"]
+"tests/**" = ["D", "E501"]
 "dataset/generate_dataset.py" = ["D", "E501"]
+"conversationTest.py" = ["D", "E501"]
+"judge_simulator.py" = ["D", "E501", "F401", "F541", "B904", "UP"]
+"scripts/**" = ["D", "E501", "E402", "F401", "F541"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -20,5 +23,10 @@ no_implicit_optional = true
 check_untyped_defs = true
 ignore_missing_imports = true
 
-[tool.mypy."tests.*"]
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = ["judge_simulator", "conversationTest", "dataset.*"]
 ignore_errors = true

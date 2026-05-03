@@ -1,30 +1,46 @@
-"""Core bot composition and context loading utilities."""
+"""Core bot composition and FastAPI surface for the Vera judge harness.
+
+This module exposes:
+    * The deterministic rule-engine composer (``compose``/``compose_async``)
+    * Pydantic schemas for the 4-context framework (category, merchant,
+      trigger, customer) plus the ``ComposedMessage`` output contract
+    * The FastAPI app implementing the 5 judge endpoints
+      (``/v1/context``, ``/v1/tick``, ``/v1/reply``, ``/v1/healthz``,
+      ``/v1/metadata``) plus an optional ``/v1/teardown``
+
+Production notes:
+    * Stateless across processes — context lives in an in-memory store, so
+      a single replica is required for the judge run window.
+    * LLM refinement is best-effort: any failure falls back silently to the
+      deterministic draft, keeping ``/v1/tick`` and ``/v1/reply`` within the
+      judge's 30 second SLA.
+"""
 
 import json
+import logging
 import os
 import re
+import time
 import uuid
-from datetime import datetime
-from functools import lru_cache
-from pathlib import Path
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Literal, TypeVar
 
-import anyio
 import anyio
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field, model_validator
-from datetime import datetime, timezone
-import time
-
-from semantic_matcher import semantic_matcher
+from pydantic import BaseModel, Field, ValidationInfo, model_validator
 
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-LLM_CLIENT = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+# IMPORTANT: load_dotenv() must run before importing llm_pool, because
+# llm_pool builds its singleton GeminiKeyPool from env at import time.
+from llm_pool import COMPOSER_CHAIN, COMPOSER_MODELS, get_pool  # noqa: E402
+from semantic_matcher import semantic_matcher  # noqa: E402
+
+logger = logging.getLogger("vera.bot")
 
 
 class AllowExtraModel(BaseModel):
@@ -130,7 +146,7 @@ class ComposedMessage(BaseModel):
     rationale: str
 
     @model_validator(mode="after")
-    def enforce_cta_position(self, info):
+    def enforce_cta_position(self, info: ValidationInfo) -> "ComposedMessage":
         """Ensure YES/STOP CTA is placed at the end when required."""
         if self.cta == "yes_no":
             if not re.search(r"\b(YES|STOP)\b\s*\.?$", self.body, flags=re.IGNORECASE):
@@ -138,7 +154,7 @@ class ComposedMessage(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def guard_promotional_tone(self, info):
+    def guard_promotional_tone(self, info: ValidationInfo) -> "ComposedMessage":
         """Reject promotional language for clinical categories."""
         category = None
         if info.context:
@@ -149,7 +165,7 @@ class ComposedMessage(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def validate_language_mix(self, info):
+    def validate_language_mix(self, info: ValidationInfo) -> "ComposedMessage":
         """Validate required Hindi-English code mix when specified."""
         if not info.context:
             return self
@@ -172,7 +188,7 @@ class ComposedMessage(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def validate_referenced_facts(self, info):
+    def validate_referenced_facts(self, info: ValidationInfo) -> "ComposedMessage":
         """Validate referenced prices against available offers."""
         if not info.context:
             return self
@@ -237,8 +253,9 @@ def _last_merchant_message(conversation_history: list[dict[str, Any]] | None) ->
     if not conversation_history:
         return None
     for entry in reversed(conversation_history):
-        if entry.get("from") == "merchant" and isinstance(entry.get("body"), str):
-            return entry["body"].strip()
+        body = entry.get("body")
+        if entry.get("from") == "merchant" and isinstance(body, str):
+            return body.strip()
     return None
 
 
@@ -266,7 +283,7 @@ def _auto_reply_detected(conversation_history: list[dict[str, Any]] | None) -> b
     last_message = merchant_messages[-1]
 
     # Strategy 2: Strict Classification Pipeline
-    return semantic_matcher.is_auto_reply(last_message, LLM_CLIENT)
+    return semantic_matcher.is_auto_reply(last_message)
 
 
 def _intent_transition_detected(message: str | None) -> bool:
@@ -278,7 +295,7 @@ def _intent_transition_detected(message: str | None) -> bool:
     if not message:
         return False
 
-    return semantic_matcher.is_intent_transition(message, LLM_CLIENT)
+    return semantic_matcher.is_intent_transition(message)
 
 
 async def _auto_reply_detected_async(
@@ -304,7 +321,6 @@ async def _intent_type_async(message: str) -> str:
     return await anyio.to_thread.run_sync(
         semantic_matcher.get_intent_type,
         message,
-        LLM_CLIENT,
     )
 
 
@@ -864,7 +880,7 @@ async def compose_async(
         "rationale": rationale,
     }
 
-    if LLM_CLIENT:
+    if COMPOSER_CHAIN.is_available():
         jit_facts = _extract_jit_facts(
             merchant_ctx=merchant_ctx,
             category_ctx=category_ctx,
@@ -882,30 +898,31 @@ async def compose_async(
             draft_body=body,
             draft_rationale=rationale,
         )
-        if os.getenv("NO_LLM") != "1":
-            try:
-                response = await anyio.to_thread.run_sync(
-                    LLM_CLIENT.models.generate_content,
-                    model="gemini-3.1-flash-lite-preview",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=ComposedMessage,
-                        temperature=0.0,
-                    ),
-                )
-                if response.text:
-                    llm_dict = json.loads(response.text)
-                    llm_dict["suppression_key"] = trigger_ctx.suppression_key
-                    message_dict = llm_dict
-            except Exception:
-                # Fallback to deterministic rule-engine output on LLM error
-                pass
+        try:
+            response, model_used = await COMPOSER_CHAIN.generate_content(
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=ComposedMessage,
+                    temperature=0.0,
+                ),
+            )
+            logger.debug("Composer used model %s", model_used)
+            if response.text:
+                llm_dict = json.loads(response.text)
+                llm_dict["suppression_key"] = trigger_ctx.suppression_key
+                message_dict = llm_dict
+        except Exception:
+            logger.warning(
+                "LLM refinement failed across all keys/models; "
+                "falling back to deterministic draft",
+                exc_info=True,
+            )
 
     # Anti-repetition: check if the body is a verbatim repeat
     is_repeat = _check_suppression_dedup(
         trigger_ctx.suppression_key,
-        message_dict["body"],
+        str(message_dict["body"]),
     )
     if is_repeat:
         message_dict["rationale"] = (
@@ -939,7 +956,7 @@ def compose(
 # Judge Simulator API (FastAPI)
 # =============================================================================
 
-app = FastAPI(title="Vera Bot API")
+START_TIME = time.time()
 
 _context_store: dict[str, dict[str, Any]] = {
     "category": {},
@@ -948,7 +965,12 @@ _context_store: dict[str, dict[str, Any]] = {
     "trigger": {},
 }
 
+VALID_SCOPES: frozenset[str] = frozenset({"category", "merchant", "customer", "trigger"})
+
+
 class ContextPush(BaseModel):
+    """Schema for /v1/context payloads pushed by the judge."""
+
     scope: str
     context_id: str
     version: int
@@ -958,19 +980,41 @@ class ContextPush(BaseModel):
 
 def _validate_scope(scope: str) -> bool:
     """Return True if scope is one of the supported context scopes."""
-    return scope in {"category", "merchant", "customer", "trigger"}
+    return scope in VALID_SCOPES
 
-@app.on_event("startup")
-async def startup_event():
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.info("Eagerly loading semantic matcher model...")
-    # This forces the lazy init to happen during startup
-    semantic_matcher._ensure_loaded()
-    logger.info("Semantic matcher loaded.")
+
+def _utc_now_iso() -> str:
+    """Return the current UTC time as a Z-suffixed ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    """FastAPI lifespan: warm the semantic matcher once at startup.
+
+    Pre-computing anchor embeddings during startup avoids paying the
+    cold-start latency on the first /v1/tick or /v1/reply call from the
+    judge harness.
+    """
+    logger.info("Eagerly loading semantic matcher anchors...")
+    try:
+        semantic_matcher._ensure_loaded()
+        logger.info("Semantic matcher ready.")
+    except Exception:
+        logger.exception("Semantic matcher warmup failed; continuing with regex fallback")
+    yield
+
+
+app = FastAPI(title="Vera Bot API", version="1.0.0", lifespan=_lifespan)
 
 @app.post("/v1/context")
-async def receive_context(push: ContextPush):
+async def receive_context(push: ContextPush) -> Any:
+    """Idempotently store a context push from the judge harness.
+
+    A repeated POST with the same ``(scope, context_id, version)`` is a
+    no-op and returns 200; a strictly-older ``version`` returns 409 with
+    ``stale_version``; an unknown scope returns 400.
+    """
     if not _validate_scope(push.scope):
         return JSONResponse(
             status_code=400,
@@ -988,7 +1032,7 @@ async def receive_context(push: ContextPush):
                 return {
                     "accepted": True,
                     "ack_id": f"ack_{uuid.uuid4().hex[:8]}",
-                    "stored_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    "stored_at": _utc_now_iso(),
                 }
             return JSONResponse(
                 status_code=409,
@@ -1002,41 +1046,53 @@ async def receive_context(push: ContextPush):
     return {
         "accepted": True,
         "ack_id": f"ack_{uuid.uuid4().hex[:8]}",
-        "stored_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        "stored_at": _utc_now_iso(),
     }
 
+
 class TickRequest(BaseModel):
+    """Schema for /v1/tick payloads."""
+
     now: str
     available_triggers: list[str] = Field(default_factory=list)
 
+
+MAX_ACTIONS_PER_TICK = 20
+
+
 @app.post("/v1/tick")
-async def handle_tick(req: TickRequest):
-    actions = []
+async def handle_tick(req: TickRequest) -> dict[str, Any]:
+    """Compose proactive actions for the active triggers (capped at 20)."""
+    actions: list[dict[str, Any]] = []
     for trigger_id in req.available_triggers:
-        if len(actions) >= 20:
+        if len(actions) >= MAX_ACTIONS_PER_TICK:
             break
         trigger_data = _context_store["trigger"].get(trigger_id)
         if not trigger_data:
             continue
         trigger_payload = trigger_data["payload"]
         merchant_id = trigger_payload.get("merchant_id")
-        
+
         merchant_data = _context_store["merchant"].get(merchant_id)
         if not merchant_data:
             continue
         merchant_payload = merchant_data["payload"]
-        
+
         category_slug = merchant_payload.get("category_slug")
         category_data = _context_store["category"].get(category_slug)
-        category_payload = category_data["payload"] if category_data else {"slug": category_slug or "unknown"}
-        
+        category_payload = (
+            category_data["payload"]
+            if category_data
+            else {"slug": category_slug or "unknown"}
+        )
+
         customer_id = trigger_payload.get("customer_id")
         customer_payload = None
         if customer_id:
             customer_data = _context_store["customer"].get(customer_id)
             if customer_data:
                 customer_payload = customer_data["payload"]
-        
+
         try:
             message = await compose_async(
                 category=category_payload,
@@ -1044,26 +1100,30 @@ async def handle_tick(req: TickRequest):
                 trigger=trigger_payload,
                 customer=customer_payload,
             )
-            if not message.get("body"):
-                continue
-            actions.append({
-                "conversation_id": f"conv_{uuid.uuid4().hex[:8]}",
-                "merchant_id": merchant_id,
-                "customer_id": customer_id,
-                "send_as": message["send_as"],
-                "trigger_id": trigger_id,
-                "template_name": "vera_template",
-                "template_params": [],
-                "body": message["body"],
-                "cta": message["cta"],
-                "suppression_key": message["suppression_key"],
-                "rationale": message["rationale"]
-            })
         except Exception:
-            pass
+            logger.exception("compose_async failed for trigger %s", trigger_id)
+            continue
+        if not message.get("body"):
+            continue
+        actions.append({
+            "conversation_id": f"conv_{uuid.uuid4().hex[:8]}",
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "send_as": message["send_as"],
+            "trigger_id": trigger_id,
+            "template_name": "vera_template",
+            "template_params": [],
+            "body": message["body"],
+            "cta": message["cta"],
+            "suppression_key": message["suppression_key"],
+            "rationale": message["rationale"],
+        })
     return {"actions": actions}
 
+
 class ReplyRequest(BaseModel):
+    """Schema for /v1/reply payloads."""
+
     conversation_id: str
     merchant_id: str
     customer_id: str | None = None
@@ -1072,49 +1132,67 @@ class ReplyRequest(BaseModel):
     received_at: str
     turn_number: int
 
-@app.post("/v1/reply")
-async def handle_reply(req: ReplyRequest):
 
-    # Guard: only act on merchant messages
+@app.post("/v1/reply")
+async def handle_reply(req: ReplyRequest) -> dict[str, Any]:
+    """Route a merchant/customer reply to the right action.
+
+    Decision pipeline:
+        1. Non-merchant or missing-context replies are no-ops.
+        2. Hostile messages immediately ``end`` the conversation.
+        3. After appending to history, four identical merchant turns in a
+           row trigger an auto-reply loop ``end``.
+        4. Auto-reply / wait / intent transitions short-circuit to fixed
+           replies.
+        5. Anything else falls through to the deterministic+LLM composer.
+    """
     if req.from_role != "merchant":
         return {"action": "noop", "rationale": "Non-merchant message, no action needed"}
 
-    # Fail fast if merchant context is missing — nothing useful can be done
     merchant_data = _context_store["merchant"].get(req.merchant_id)
     if not merchant_data:
         return {"action": "noop", "rationale": "Merchant context not found"}
 
-    # Single semantic classification
     intent_type = await _intent_type_async(req.message)
 
-    # Hostile exits before touching history
     if intent_type == "hostile":
         return {"action": "end", "rationale": "Merchant is hostile; gracefully exiting"}
 
-    # Append to history after hostile check
     history = merchant_data["payload"].setdefault("conversation_history", [])
     history.append({"from": req.from_role, "body": req.message})
 
-    # Hard auto-reply loop guard
-    merchant_messages = [e.get("body", "") for e in history if e.get("from") == "merchant"]
+    merchant_messages = [
+        entry.get("body", "")
+        for entry in history
+        if entry.get("from") == "merchant"
+    ]
     if len(merchant_messages) >= 4 and len(set(merchant_messages[-4:])) == 1:
         return {"action": "end", "rationale": "Auto-reply loop detected"}
 
-    # Route by intent type
     if intent_type == "auto_reply":
         return {"action": "end", "rationale": "Auto-responder detected; aborting"}
 
     if intent_type == "wait":
-        return {"action": "wait", "wait_seconds": 1800, "rationale": "Merchant needs time; backing off 30 minutes"}
+        return {
+            "action": "wait",
+            "wait_seconds": 1800,
+            "rationale": "Merchant needs time; backing off 30 minutes",
+        }
 
     if intent_type == "intent_transition":
-        return {"action": "send", "body": "Got it! Let's proceed with the details.", "cta": "open_ended", "rationale": "Acknowledged intent to proceed"}
+        return {
+            "action": "send",
+            "body": "Got it! Let's proceed with the details.",
+            "cta": "open_ended",
+            "rationale": "Acknowledged intent to proceed",
+        }
 
-    # "neither" — route to main compose pipeline
     merchant_payload = merchant_data["payload"]
     category_slug = merchant_payload.get("category_slug", "unknown")
     category_data = _context_store["category"].get(category_slug)
-    category_payload = category_data["payload"] if category_data else {"slug": category_slug}
+    category_payload = (
+        category_data["payload"] if category_data else {"slug": category_slug}
+    )
 
     customer_payload = None
     if req.customer_id:
@@ -1136,41 +1214,100 @@ async def handle_reply(req: ReplyRequest):
             },
             customer=customer_payload,
         )
-        return {"action": "send", "body": composed["body"], "cta": composed["cta"], "rationale": composed["rationale"]}
+        return {
+            "action": "send",
+            "body": composed["body"],
+            "cta": composed["cta"],
+            "rationale": composed["rationale"],
+        }
     except Exception:
         logger.exception("compose_async failed in /v1/reply")
-        return {"action": "send", "body": "Could you tell me a bit more?", "cta": "open_ended", "rationale": "compose_async error; generic fallback"}
+        return {
+            "action": "send",
+            "body": "Could you tell me a bit more?",
+            "cta": "open_ended",
+            "rationale": "compose_async error; generic fallback",
+        }
 
-START_TIME = time.time()
 
 @app.get("/v1/healthz")
-async def healthz():
+async def healthz() -> dict[str, Any]:
+    """Liveness probe — uptime + counts of stored contexts per scope."""
     return {
         "status": "ok",
         "uptime_seconds": int(time.time() - START_TIME),
-        "contexts_loaded": {
-            k: len(v) for k, v in _context_store.items()
-        }
+        "contexts_loaded": {scope: len(items) for scope, items in _context_store.items()},
     }
+
+
+# Stable team identity — mirrored into /v1/metadata so the judge harness
+# can attribute scoring to the right team without re-deploying when the
+# rest of the bot evolves.
+TEAM_NAME = "SunChillFlower"
+TEAM_MEMBERS: list[str] = ["Animesh Tripathi"]
+CONTACT_EMAIL = "AnimeshTripathi.who@gmail.com"
+APP_VERSION = "1.0.0"
+
+# Multi-line description of the actual approach used by the bot. Kept as a
+# module-level constant so it's easy to update without touching the route.
+APPROACH_DESCRIPTION = (
+    "Hybrid deterministic-rule engine + multi-key Gemini LLM refinement with "
+    "model-level fallback. "
+    "Pipeline: (1) Pydantic validates the 4-context framework and enforces "
+    "CTA position, voice/tone, code-mix, and offer-price hallucination guards. "
+    "(2) A deterministic composer picks a strategy "
+    "(auto_reply_exit / intent_transition / customer_facing / digest_anchor / "
+    "benchmark_anchor / fallback), selects a compulsion lever via an "
+    "O(1) trigger-kind LEVER_MAP, applies category VOICE_PREFIX_MAP, and "
+    "enforces binary-CTA for action triggers. "
+    "(3) Just-in-time facts (~5-10 keys) plus a lever-specific prompt fragment "
+    "are sent through an async load-balanced GeminiKeyPool at temperature 0 "
+    "with a ComposedMessage response_schema for strict JSON; the chain "
+    "rotates round-robin across keys with per-(key, model) cooldowns and "
+    "falls back through the configured composer model chain when every key "
+    "is rate-limited; failure across the whole chain returns the deterministic "
+    "draft. "
+    "(4) /v1/reply uses a 3-stage semantic_matcher (regex -> BGE-M3 sentence "
+    "embeddings via HF Inference -> load-balanced Gemma classifier chain) to "
+    "classify auto_reply / intent_transition / hostile / wait / neither and "
+    "route accordingly. (5) suppression_key dedup prevents verbatim repeats."
+)
+
 
 @app.get("/v1/metadata")
-async def metadata():
+async def metadata() -> dict[str, Any]:
+    """Bot identity + a description of the architectural approach."""
+    pool = get_pool()
     return {
-        "team_name": "SunChillFlower",
-        "team_members": ["Animesh Tripathi"],
-        "model": "gemini-3.1-flash-lite-preview",
-        "approach": "modular prompt template with suppression dedup",
-        "contact_email": "AnimeshTripathi.who@gmail.com",
-        "version": "1.0.0",
-        "submitted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        "team_name": TEAM_NAME,
+        "team_members": TEAM_MEMBERS,
+        "model": COMPOSER_MODELS[0] if COMPOSER_MODELS else "deterministic",
+        "model_chain": COMPOSER_MODELS,
+        "approach": APPROACH_DESCRIPTION,
+        "contact_email": CONTACT_EMAIL,
+        "version": APP_VERSION,
+        "submitted_at": _utc_now_iso(),
+        "llm_keys_configured": pool.size if pool else 0,
     }
 
+
 @app.post("/v1/teardown")
-async def teardown():
+async def teardown() -> dict[str, Any]:
+    """Wipe all in-memory state. Called by the judge harness at test end."""
     for scope in _context_store:
         _context_store[scope].clear()
+    _suppression_store.clear()
+    pool = get_pool()
+    if pool is not None:
+        pool.reset_cooldowns()
     return {"status": "ok", "message": "State wiped"}
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+
+    uvicorn.run(
+        app,
+        host=os.getenv("VERA_HOST", "0.0.0.0"),
+        port=int(os.getenv("VERA_PORT", "8080")),
+    )

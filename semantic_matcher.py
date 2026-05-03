@@ -1,31 +1,35 @@
-"""Semantic similarity matcher using the BGE-M3 sentence transformer.
+"""Semantic message classifier for the Vera bot.
 
-This module provides intent and auto-reply detection by comparing incoming
-messages against curated anchor phrases using cosine similarity, rather than
-brittle regex patterns.  The underlying model is ``BAAI/bge-m3``,
-a multilingual model with excellent support for English, Hindi, and transliterated
-Indian languages, producing highly discriminative sentence embeddings.
+Three-stage classification pipeline used by ``bot.py`` to route merchant
+replies into one of five buckets (``auto_reply``, ``intent_transition``,
+``hostile``, ``wait``, ``neither``):
 
-Classification pipeline per message:
-    Stage 1 — Fast-path Regex  (zero latency)
-    Stage 2 — BGE-M3 semantic similarity via HF InferenceClient
-    Stage 3 — Gemma-3 LLM fallback (only when Stage 2 is inconclusive)
+    Stage 1 — Fast-path regex (zero latency, ~0 cost)
+    Stage 2 — Cosine similarity over BGE-M3 sentence embeddings
+              (``BAAI/bge-m3`` via the Hugging Face Inference API)
+    Stage 3 — Gemma-3 LLM fallback when Stage 2 is below threshold
 
-Possible return values from get_intent_type:
-    "auto_reply"        — canned/automated response, end conversation
-    "intent_transition" — merchant explicitly wants to proceed/join
-    "hostile"           — merchant is annoyed, wants to stop
-    "wait"              — merchant needs time, back off
-    "neither"           — live conversation, route to main bot
+BGE-M3 is multilingual and handles English, Devanagari Hindi, and
+transliterated Hinglish well — which matches the real-world WhatsApp
+traffic the judge harness simulates. Anchors are pre-computed once at
+startup so steady-state classification is a single embedding call plus
+4 dot-products.
+
+Set ``NO_LLM=1`` in the environment to disable both Stage 2 and Stage 3
+(useful for deterministic tests / CI).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import re
+
+if TYPE_CHECKING:
+    from huggingface_hub import InferenceClient
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +200,8 @@ class SemanticMatcher:
     """
 
     def __init__(self) -> None:
-        self._client = None
+        """Create an unloaded matcher; embeddings are computed in _ensure_loaded."""
+        self._client: InferenceClient | None = None
         self._auto_reply_embeddings: np.ndarray | None = None
         self._intent_embeddings: np.ndarray | None = None
         self._hostile_embeddings: np.ndarray | None = None
@@ -206,8 +211,14 @@ class SemanticMatcher:
     # -- helpers ------------------------------------------------------------
 
     def _embed(self, texts: list[str]) -> np.ndarray:
-        """Return a normalised (N, D) embedding matrix for *texts*."""
-        raw = self._client.feature_extraction(texts, model=_MODEL_NAME)
+        """Return a normalised (N, D) embedding matrix for *texts*.
+
+        The HF InferenceClient accepts both a single string and a list of
+        strings at runtime; we always pass a list so the result is
+        consistently shaped and can be batched.
+        """
+        assert self._client is not None, "_embed called before _ensure_loaded"
+        raw = self._client.feature_extraction(texts, model=_MODEL_NAME)  # type: ignore[arg-type]
         matrix = np.array(raw, dtype=np.float32)
         if matrix.ndim == 3:
             matrix = matrix[:, 0, :]
@@ -250,17 +261,25 @@ class SemanticMatcher:
 
     # -- classification -----------------------------------------------------
 
-    def get_intent_type(self, message: str, llm_client=None) -> str:
+    def get_intent_type(self, message: str, llm_client: Any = None) -> str:
         """Classify a merchant message into one of five categories.
 
         Returns one of: "auto_reply", "intent_transition", "hostile",
         "wait", "neither".
 
         Pipeline:
-            Stage 1 — Fast-path regex  (zero latency)
+            Stage 1 — Fast-path regex (zero latency)
             Stage 2 — BGE-M3 semantic similarity via HF InferenceClient
-            Stage 3 — Gemma-3 LLM fallback (only when Stage 2 is inconclusive)
+            Stage 3 — Load-balanced Gemma classifier chain
+                      (only when Stage 2 is inconclusive)
+
+        The ``llm_client`` argument is accepted for backward compatibility
+        but ignored: Stage 3 always goes through the shared
+        :data:`llm_pool.CLASSIFIER_CHAIN`, which load-balances across
+        every configured ``GEMINI_API_KEY`` and falls back through the
+        configured Gemma model chain when keys are exhausted.
         """
+        del llm_client  # unused — kept for backward compatibility
         if message in self._cache:
             return self._cache[message]
 
@@ -320,7 +339,7 @@ class SemanticMatcher:
 
         if cleared:
             # Highest score wins when multiple thresholds are cleared
-            ans = max(cleared, key=lambda l: cleared[l])
+            ans = max(cleared, key=lambda label: cleared[label])
             return self._cache_and_return(message, ans)
 
         # ------------------------------------------------------------------
@@ -333,8 +352,12 @@ class SemanticMatcher:
         )
 
         ans = "neither"
-        if llm_client is not None and os.getenv("NO_LLM") != "1":
-            prompt = f'''Classify the following merchant message into EXACTLY ONE of these categories:
+        # Local import to avoid circular import at module load time.
+        from llm_pool import CLASSIFIER_CHAIN
+
+        if CLASSIFIER_CHAIN.is_available():
+            prompt = f'''Classify the following merchant message into EXACTLY ONE of \
+these categories:
 - intent (Explicitly expressing interest, agreeing to proceed, or asking to sign up/join)
 - auto-reply (Automated out-of-office, unmonitored mailbox, or automated ticket response)
 - hostile (Merchant is annoyed, wants to stop receiving messages, asks to unsubscribe)
@@ -348,11 +371,12 @@ Rules:
 Message: "{message}"'''
             try:
                 from google.genai import types
-                response = llm_client.models.generate_content(
-                    model="gemma-3-12b-it",
+
+                response, model_used = CLASSIFIER_CHAIN.generate_content_sync(
                     contents=prompt,
                     config=types.GenerateContentConfig(temperature=0.0),
                 )
+                logger.debug("Classifier used model %s", model_used)
                 if response.text:
                     res = response.text.strip().lower()
                     if "auto-reply" in res:
@@ -363,8 +387,10 @@ Message: "{message}"'''
                         ans = "hostile"
                     elif "wait" in res:
                         ans = "wait"
-            except Exception as e:
-                logger.warning("LLM fallback classification failed: %s", e)
+            except Exception as exc:
+                logger.warning(
+                    "Classifier chain exhausted across all keys/models: %s", exc,
+                )
 
         return self._cache_and_return(message, ans)
 
@@ -377,34 +403,46 @@ Message: "{message}"'''
 
     # -- convenience wrappers -----------------------------------------------
 
-    def is_auto_reply(self, message: str, llm_client=None) -> bool:
+    def is_auto_reply(self, message: str, llm_client: Any = None) -> bool:
+        """Return True if the message is classified as a canned auto-reply."""
         return self.get_intent_type(message, llm_client) == "auto_reply"
 
-    def is_intent_transition(self, message: str, llm_client=None) -> bool:
+    def is_intent_transition(self, message: str, llm_client: Any = None) -> bool:
+        """Return True if the merchant explicitly signalled intent to proceed."""
         return self.get_intent_type(message, llm_client) == "intent_transition"
 
-    def is_hostile(self, message: str, llm_client=None) -> bool:
+    def is_hostile(self, message: str, llm_client: Any = None) -> bool:
+        """Return True if the merchant is hostile / wants to stop receiving messages."""
         return self.get_intent_type(message, llm_client) == "hostile"
 
-    def is_wait(self, message: str, llm_client=None) -> bool:
+    def is_wait(self, message: str, llm_client: Any = None) -> bool:
+        """Return True if the merchant is asking to be contacted later."""
         return self.get_intent_type(message, llm_client) == "wait"
 
     def classify(self, message: str) -> dict[str, float]:
         """Return all four similarity scores for diagnostics.
 
-        Returns a dict with keys: auto_reply, intent, hostile, wait.
-        All values are in [0, 1]. Returns zeros if client is unavailable.
+        Returns a dict with keys: ``auto_reply``, ``intent``, ``hostile``,
+        ``wait``. All values are in [0, 1]. Returns zeros if the inference
+        client (or any of the anchor embedding matrices) is unavailable —
+        for example when ``NO_LLM=1`` is set or the HF API call failed.
         """
         self._ensure_loaded()
-        if self._client is None:
+        if (
+            self._client is None
+            or self._auto_reply_embeddings is None
+            or self._intent_embeddings is None
+            or self._hostile_embeddings is None
+            or self._wait_embeddings is None
+        ):
             return {"auto_reply": 0.0, "intent": 0.0, "hostile": 0.0, "wait": 0.0}
 
         emb = self._embed([message])
         return {
             "auto_reply": float(np.max(emb @ self._auto_reply_embeddings.T)),
-            "intent":     float(np.max(emb @ self._intent_embeddings.T)),
-            "hostile":    float(np.max(emb @ self._hostile_embeddings.T)),
-            "wait":       float(np.max(emb @ self._wait_embeddings.T)),
+            "intent": float(np.max(emb @ self._intent_embeddings.T)),
+            "hostile": float(np.max(emb @ self._hostile_embeddings.T)),
+            "wait": float(np.max(emb @ self._wait_embeddings.T)),
         }
 
 

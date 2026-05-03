@@ -7,15 +7,30 @@ CTAs) to a JSONL file, then scores each conversation against the
 5 win criteria from the challenge brief.
 
 Usage:
-    # Make sure bot is running: uvicorn bot:app --port 8080
-    python test_conversations.py
+    # Make sure the bot is running: uvicorn bot:app --port 8080
+    python conversationTest.py
 
     # Run against a different host:
-    BOT_URL=http://localhost:9000 python test_conversations.py
+    BOT_URL=http://localhost:9000 python conversationTest.py
+
+    # Run a single scenario by name:
+    SCENARIO=S2_studio11_auto_reply python conversationTest.py
 
 Output:
     conversations.jsonl  — every turn, CTA, rationale, and score
     summary.txt          — per-scenario win-criterion breakdown
+
+Real-world mimicry checklist (per the brief):
+    - Hits the same 5 endpoints the magicpin judge harness hits
+      (/v1/context, /v1/tick, /v1/reply, /v1/healthz, /v1/teardown).
+    - Drives 5-6 turn conversations matching the four reference patterns
+      in §9 of the brief (real intent, auto-reply exit, hostile, intent
+      transition).
+    - Mixes English, Hindi, and Hinglish messages.
+    - Covers all 5 categories (dentists, salons, restaurants, gyms,
+      and pharmacies-via-recall).
+    - Scores each composed message on the 5 win-criteria dimensions
+      with anti-pattern penalties from §11.
 """
 
 from __future__ import annotations
@@ -25,8 +40,7 @@ import os
 import re
 import sys
 import time
-import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -37,8 +51,9 @@ import httpx
 # ---------------------------------------------------------------------------
 
 BOT_URL = os.getenv("BOT_URL", "http://localhost:8080")
-OUTPUT_FILE = "conversations.jsonl"
-SUMMARY_FILE = "summary.txt"
+OUTPUT_FILE = os.getenv("CONV_OUTPUT", "conversations.jsonl")
+SUMMARY_FILE = os.getenv("CONV_SUMMARY", "summary.txt")
+SCENARIO_FILTER = os.getenv("SCENARIO", "").strip()
 TIMEOUT = 30  # seconds per HTTP call
 
 # ---------------------------------------------------------------------------
@@ -60,7 +75,7 @@ _LEVER_SIGNALS = {
     "specificity":           [r"\d[\d,]+", r"₹\s?\d+", r"\d+%", r"p\.\d+", r"\bjida\b", r"\btrial\b"],
     "loss_aversion":         [r"miss(ing|ed)", r"gap\b", r"below\b", r"before.*close", r"losing"],
     "social_proof":          [r"peer", r"others in your area", r"locality", r"similar\s+\w+\s+in", r"\d+\s+dentist"],
-    "effort_externalization":["draft", r"just say yes", r"i can set", r"ready for you", r"5.min"],
+    "effort_externalization":[r"draft", r"just say yes", r"i can set", r"ready for you", r"5.min"],
     "curiosity":             [r"want to see", r"want me to", r"shall i", r"interested\?"],
     "binary_cta":            [r"\byes\b.*\bstop\b|\bstop\b.*\byes\b"],
 }
@@ -76,18 +91,18 @@ _VOICE_SIGNALS = {
 
 # Promo-tone taboo words per category
 _PROMO_TABOOS = {
-    "dentists":  ["guaranteed", "cure", "amazing", "best deal", "hurry"],
-    "salons":    ["guaranteed", "amazing"],
-    "gyms":      ["guaranteed", "amazing"],
-    "pharmacies":["guaranteed", "amazing"],
+    "dentists":   ["guaranteed", "cure", "amazing", "best deal", "hurry"],
+    "salons":     ["guaranteed", "amazing"],
+    "gyms":       ["guaranteed", "amazing"],
+    "pharmacies": ["guaranteed", "amazing"],
     "restaurants":[],
 }
 
 
 def score_message(body: str, cta: str, category_slug: str,
                   trigger_kind: str, merchant_name: str) -> dict[str, int]:
-    """
-    Score a single composed message against the 5 win criteria.
+    """Score a single composed message against the 5 win criteria.
+
     Returns dict with keys: specificity, category_fit, merchant_fit,
     trigger_relevance, engagement_compulsion, total (all 0-10, total 0-50).
     """
@@ -106,7 +121,6 @@ def score_message(body: str, cta: str, category_slug: str,
         spec += 2
     if re.search(r"p\.\d+|page\s+\d+", body_lower):
         spec += 1
-    # Penalise generic discount language
     if re.search(r"\bflat\s*\d+%\s*off\b", body_lower):
         spec -= 3
     scores["specificity"] = max(0, min(10, spec))
@@ -114,19 +128,18 @@ def score_message(body: str, cta: str, category_slug: str,
     # ------------------------------------------------------------------
     # 2. Category fit — voice, vocabulary, taboo avoidance
     # ------------------------------------------------------------------
-    cat = 5  # baseline
+    cat = 5
     voice_words = _VOICE_SIGNALS.get(category_slug, [])
     hits = sum(1 for w in voice_words if w in body_lower)
     cat += min(hits * 2, 4)
     taboos = _PROMO_TABOOS.get(category_slug, [])
     taboo_hits = sum(1 for t in taboos if t in body_lower)
     cat -= taboo_hits * 3
-    # Check voice prefix is present for known categories
     voice_prefixes = {
-        "dentists": "clinical note",
-        "salons": "quick tip",
-        "restaurants": "quick ops note",
-        "gyms": "coach",
+        "dentists":   "clinical note",
+        "salons":     "quick tip",
+        "restaurants":"quick ops note",
+        "gyms":       "coach",
         "pharmacies": "compliance note",
     }
     if voice_prefixes.get(category_slug, "") in body_lower:
@@ -136,19 +149,15 @@ def score_message(body: str, cta: str, category_slug: str,
     # ------------------------------------------------------------------
     # 3. Merchant fit — personalization, language pref
     # ------------------------------------------------------------------
-    merch = 3  # baseline
-    # Merchant name mentioned
+    merch = 3
     if merchant_name.lower().split()[0] in body_lower:
         merch += 2
-    # Hindi-English mix (for hi-en mix merchants)
     has_hindi = bool(re.search(r"\b(ji|hai|karo|aap|hoon|mein|ka|ki|ke|baat|kya)\b", body_lower))
     has_english = bool(re.search(r"\b(hi|hello|yes|ready|plan|profile|update)\b", body_lower))
     if has_hindi and has_english:
         merch += 3
-    # Penalise re-introduction
     if re.search(r"\bi'?m vera\b|\bthis is vera\b", body_lower):
         merch -= 2
-    # Penalise long preamble
     if re.search(r"i hope you('re| are) doing well", body_lower):
         merch -= 2
     scores["merchant_fit"] = max(0, min(10, merch))
@@ -156,7 +165,7 @@ def score_message(body: str, cta: str, category_slug: str,
     # ------------------------------------------------------------------
     # 4. Trigger relevance — message communicates WHY NOW
     # ------------------------------------------------------------------
-    trig = 3  # baseline
+    trig = 3
     kind_signals = {
         "research_digest":    ["digest", "jida", "research", "trial", "study", "issue"],
         "perf_dip":           ["drop", "dip", "missed", "below", "calls", "views"],
@@ -169,9 +178,8 @@ def score_message(body: str, cta: str, category_slug: str,
         "renewal_due":        ["renewal", "expir", "days remaining", "subscription"],
         "festival_upcoming":  ["festival", "diwali", "holi", "eid", "navratri"],
         "review_theme_emerged":["review", "feedback", "patients say", "mentions"],
-        "reply":              [],  # catch-all for /v1/reply routing
+        "reply":              [],
     }
-    # Substring match for compound kinds like "research_digest_release"
     matched_signals: list[str] = []
     for kind_key, signals in kind_signals.items():
         if kind_key in trigger_kind:
@@ -184,21 +192,17 @@ def score_message(body: str, cta: str, category_slug: str,
     # ------------------------------------------------------------------
     # 5. Engagement compulsion — levers, CTA shape
     # ------------------------------------------------------------------
-    comp = 2  # baseline
-    for lever, patterns in _LEVER_SIGNALS.items():
+    comp = 2
+    for _, patterns in _LEVER_SIGNALS.items():
         if any(re.search(p, body_lower) for p in patterns):
             comp += 1
-    # Binary CTA ends correctly
     if cta == "yes_no" and re.search(r"\b(yes|stop)\b\s*\.?\s*$", body_lower):
         comp += 2
-    # Open-ended question present
     if re.search(r"\?", body):
         comp += 1
-    # Anti-patterns penalty
     for pattern, _ in _ANTI_PATTERNS:
         if re.search(pattern, body_lower):
             comp -= 2
-    # Multiple CTAs penalty
     yes_count = len(re.findall(r"\byes\b", body_lower))
     stop_count = len(re.findall(r"\bstop\b", body_lower))
     if yes_count > 1 or stop_count > 1:
@@ -216,20 +220,23 @@ def score_message(body: str, cta: str, category_slug: str,
 @dataclass
 class MerchantReply:
     """A scripted merchant reply for a given turn."""
+
     body: str
-    description: str   # what this reply is testing
+    description: str
+
 
 @dataclass
 class Scenario:
     """One end-to-end conversation scenario."""
+
     name: str
     description: str
     category: dict[str, Any]
     merchant: dict[str, Any]
     trigger: dict[str, Any]
     customer: dict[str, Any] | None
-    merchant_replies: list[MerchantReply]   # 4-5 replies → 5-6 total turns
-    expected_win_criteria: dict[str, int]   # minimum expected scores
+    merchant_replies: list[MerchantReply]
+    expected_win_criteria: dict[str, int]
 
 
 SCENARIOS: list[Scenario] = [
@@ -568,6 +575,10 @@ SCENARIOS: list[Scenario] = [
 # HTTP client helpers
 # ---------------------------------------------------------------------------
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _post(path: str, body: dict) -> dict:
     url = f"{BOT_URL}{path}"
     resp = httpx.post(url, json=body, timeout=TIMEOUT)
@@ -588,13 +599,13 @@ def push_context(scope: str, context_id: str, payload: dict) -> None:
         "context_id": context_id,
         "version": 1,
         "payload": payload,
-        "delivered_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "delivered_at": _utc_now_iso(),
     })
 
 
 def fire_tick(trigger_id: str) -> list[dict]:
     result = _post("/v1/tick", {
-        "now": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "now": _utc_now_iso(),
         "available_triggers": [trigger_id],
     })
     return result.get("actions", [])
@@ -608,7 +619,7 @@ def send_reply(conversation_id: str, merchant_id: str, customer_id: str | None,
         "customer_id": customer_id,
         "from_role": "merchant",
         "message": message,
-        "received_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "received_at": _utc_now_iso(),
         "turn_number": turn_number,
     })
 
@@ -624,10 +635,10 @@ def teardown() -> None:
 @dataclass
 class Turn:
     turn_number: int
-    from_role: str        # "vera" | "merchant"
+    from_role: str
     body: str
     cta: str | None
-    action: str | None    # "send" | "end" | "wait" | "noop"
+    action: str | None
     rationale: str
     scores: dict[str, int] = field(default_factory=dict)
 
@@ -641,7 +652,7 @@ class ConversationResult:
     trigger_kind: str
     merchant_name: str
     turns: list[Turn]
-    final_scores: dict[str, int]        # averaged across vera turns
+    final_scores: dict[str, int]
     expected_scores: dict[str, int]
     passed: bool
 
@@ -654,7 +665,6 @@ def run_scenario(s: Scenario) -> ConversationResult:
 
     turns: list[Turn] = []
 
-    # --- Push context ---
     push_context("category", s.category["slug"], s.category)
     push_context("merchant", s.merchant["merchant_id"], s.merchant)
     push_context("trigger", s.trigger["id"], s.trigger)
@@ -667,10 +677,9 @@ def run_scenario(s: Scenario) -> ConversationResult:
         or "there"
     )
 
-    # --- Turn 1: bot fires the first message via /v1/tick ---
     actions = fire_tick(s.trigger["id"])
     if not actions:
-        print("  ⚠️  No action from /v1/tick — skipping scenario")
+        print("  WARN: No action from /v1/tick — skipping scenario")
         return ConversationResult(
             scenario_name=s.name,
             scenario_description=s.description,
@@ -695,14 +704,12 @@ def run_scenario(s: Scenario) -> ConversationResult:
     t1 = Turn(1, "vera", vera_body, vera_cta, "send", vera_rationale, vera_scores)
     turns.append(t1)
 
-    print(f"\n  [Turn 1 — Vera]")
+    print("\n  [Turn 1 — Vera]")
     print(f"    {vera_body}")
     print(f"    CTA: {vera_cta} | Score: {vera_scores['total']}/50")
 
-    # --- Subsequent turns ---
     turn_number = 2
-    for reply_idx, merchant_reply in enumerate(s.merchant_replies):
-        # Merchant turn
+    for merchant_reply in s.merchant_replies:
         merchant_turn = Turn(
             turn_number, "merchant", merchant_reply.body, None, None,
             f"test: {merchant_reply.description}",
@@ -712,7 +719,6 @@ def run_scenario(s: Scenario) -> ConversationResult:
         print(f"    {merchant_reply.body}")
         turn_number += 1
 
-        # Bot reply
         bot_response = send_reply(
             conversation_id=conversation_id,
             merchant_id=s.merchant["merchant_id"],
@@ -744,12 +750,10 @@ def run_scenario(s: Scenario) -> ConversationResult:
 
         turn_number += 1
 
-        # Stop if bot ended or waited
         if bot_action in ("end", "wait"):
-            print(f"  → Conversation {bot_action}ed at turn {turn_number - 1}")
+            print(f"  -> Conversation {bot_action}ed at turn {turn_number - 1}")
             break
 
-    # --- Aggregate vera scores ---
     vera_turns = [t for t in turns if t.from_role == "vera" and t.scores]
     if vera_turns:
         dims = ["specificity", "category_fit", "merchant_fit", "trigger_relevance", "engagement_compulsion"]
@@ -761,7 +765,6 @@ def run_scenario(s: Scenario) -> ConversationResult:
     else:
         final_scores = {}
 
-    # --- Check against expected ---
     passed = all(
         final_scores.get(dim, 0) >= threshold
         for dim, threshold in s.expected_win_criteria.items()
@@ -801,7 +804,7 @@ def save_jsonl(results: list[ConversationResult], path: str) -> None:
                     "action": turn.action,
                     "rationale": turn.rationale,
                     "scores": turn.scores,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": _utc_now_iso(),
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
     print(f"\n  Saved {path}")
@@ -813,7 +816,7 @@ def save_summary(results: list[ConversationResult], path: str) -> None:
 
     lines.append("=" * 70)
     lines.append("VERA BOT — WIN CRITERION SUMMARY")
-    lines.append(f"Run at: {datetime.now(timezone.utc).isoformat()}")
+    lines.append(f"Run at: {_utc_now_iso()}")
     lines.append("=" * 70)
 
     passed = sum(1 for r in results if r.passed)
@@ -821,8 +824,8 @@ def save_summary(results: list[ConversationResult], path: str) -> None:
     lines.append("")
 
     for r in results:
-        status = "✅ PASS" if r.passed else "❌ FAIL"
-        lines.append(f"{status}  {r.scenario_name}")
+        status = "PASS" if r.passed else "FAIL"
+        lines.append(f"[{status}]  {r.scenario_name}")
         lines.append(f"  {r.scenario_description}")
         lines.append(f"  Turns recorded: {len(r.turns)}")
         lines.append("")
@@ -833,15 +836,14 @@ def save_summary(results: list[ConversationResult], path: str) -> None:
             for d in dims:
                 got = r.final_scores.get(d, 0)
                 minimum = r.expected_scores.get(d, 0)
-                ok = "✅" if got >= minimum else "❌"
+                ok = "PASS" if got >= minimum else "FAIL"
                 lines.append(f"  {d:<25} {got:>5}  {minimum:>5}  {ok:>6}")
-            lines.append(f"  {'TOTAL':<25} {r.final_scores.get('total',0):>5}  {sum(r.expected_scores.values()):>5}")
+            lines.append(f"  {'TOTAL':<25} {r.final_scores.get('total', 0):>5}  {sum(r.expected_scores.values()):>5}")
         else:
             lines.append("  (no vera turns scored)")
 
         lines.append("")
 
-    # Overall dimension averages
     lines.append("=" * 70)
     lines.append("OVERALL DIMENSION AVERAGES")
     lines.append("")
@@ -854,7 +856,6 @@ def save_summary(results: list[ConversationResult], path: str) -> None:
         lines.append(f"  {'TOTAL':<25} {total_avg:.1f} / 50")
     lines.append("")
 
-    # Anti-patterns report
     lines.append("=" * 70)
     lines.append("ANTI-PATTERN REPORT")
     lines.append("")
@@ -863,7 +864,7 @@ def save_summary(results: list[ConversationResult], path: str) -> None:
         for body in vera_bodies:
             for pattern, label in _ANTI_PATTERNS:
                 if re.search(pattern, body.lower()):
-                    lines.append(f"  ⚠️  {r.scenario_name}: [{label}] found in: {body[:80]}…")
+                    lines.append(f"  WARN  {r.scenario_name}: [{label}] found in: {body[:80]}...")
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -875,19 +876,22 @@ def save_summary(results: list[ConversationResult], path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    # Health check
     try:
         health = _get("/v1/healthz")
         print(f"Bot is up — uptime {health.get('uptime_seconds', '?')}s")
     except Exception as e:
-        print(f"❌ Cannot reach bot at {BOT_URL}: {e}")
-        print("   Make sure the bot is running: uvicorn bot:app --port 8080")
+        print(f"ERROR: cannot reach bot at {BOT_URL}: {e}")
+        print("       Start the bot first: uvicorn bot:app --port 8080")
         sys.exit(1)
 
     results: list[ConversationResult] = []
+    scenarios = [s for s in SCENARIOS if not SCENARIO_FILTER or s.name == SCENARIO_FILTER]
+    if SCENARIO_FILTER and not scenarios:
+        print(f"ERROR: no scenario named {SCENARIO_FILTER!r}")
+        print(f"       available: {[s.name for s in SCENARIOS]}")
+        sys.exit(2)
 
-    for scenario in SCENARIOS:
-        # Clean state before each scenario
+    for scenario in scenarios:
         teardown()
         time.sleep(0.3)
 
@@ -895,19 +899,17 @@ def main() -> None:
             result = run_scenario(scenario)
             results.append(result)
         except Exception as e:
-            print(f"\n  ❌ Scenario {scenario.name} crashed: {e}")
+            print(f"\n  ERROR: scenario {scenario.name} crashed: {e}")
             import traceback
             traceback.print_exc()
 
-        time.sleep(0.5)  # brief pause between scenarios
+        time.sleep(0.5)
 
-    # Save outputs
     print("\n")
     save_jsonl(results, OUTPUT_FILE)
     save_summary(results, SUMMARY_FILE)
 
-    # Print summary to stdout
-    with open(SUMMARY_FILE) as f:
+    with open(SUMMARY_FILE, encoding="utf-8") as f:
         print(f.read())
 
 

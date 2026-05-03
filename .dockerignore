@@ -1,0 +1,33 @@
+.git
+.github
+.gitignore
+.githooks
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.DS_Store
+.env
+.env.*
+.idea
+.vscode
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# dev-only assets
+tests/
+agent/
+requirements/
+expanded/
+dataset/
+logs/
+conversations.jsonl
+summary.txt
+
+# scripts not needed in the container
+conversationTest.py
+judge_simulator.py
+lint.sh
+.pre-commit-config.yaml

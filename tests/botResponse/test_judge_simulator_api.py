@@ -1,7 +1,8 @@
 import unittest
+
 from fastapi.testclient import TestClient
 
-from bot import app, _context_store
+from bot import _context_store, app
 
 
 class TestJudgeSimulatorAPI(unittest.TestCase):

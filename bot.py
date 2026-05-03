@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field, model_validator
@@ -916,11 +917,16 @@ _context_store: dict[str, dict[str, Any]] = {
 }
 
 class ContextPush(BaseModel):
-    scope: Literal["category", "merchant", "customer", "trigger"]
+    scope: str
     context_id: str
     version: int
     payload: dict[str, Any]
     delivered_at: str
+
+
+def _validate_scope(scope: str) -> bool:
+    """Return True if scope is one of the supported context scopes."""
+    return scope in {"category", "merchant", "customer", "trigger"}
 
 @app.on_event("startup")
 async def startup_event():
@@ -933,6 +939,15 @@ async def startup_event():
 
 @app.post("/v1/context")
 async def receive_context(push: ContextPush):
+    if not _validate_scope(push.scope):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "accepted": False,
+                "reason": "invalid_scope",
+                "details": f"Unsupported scope: {push.scope}",
+            },
+        )
     store = _context_store[push.scope]
     if push.context_id in store:
         current_version = store[push.context_id]["version"]
@@ -943,13 +958,13 @@ async def receive_context(push: ContextPush):
                     "ack_id": f"ack_{uuid.uuid4().hex[:8]}",
                     "stored_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
                 }
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
+            return JSONResponse(
+                status_code=409,
+                content={
                     "accepted": False,
                     "reason": "stale_version",
-                    "current_version": current_version
-                }
+                    "current_version": current_version,
+                },
             )
     store[push.context_id] = {"version": push.version, "payload": push.payload}
     return {
@@ -966,6 +981,8 @@ class TickRequest(BaseModel):
 async def handle_tick(req: TickRequest):
     actions = []
     for trigger_id in req.available_triggers:
+        if len(actions) >= 20:
+            break
         trigger_data = _context_store["trigger"].get(trigger_id)
         if not trigger_data:
             continue
@@ -995,6 +1012,8 @@ async def handle_tick(req: TickRequest):
                 trigger=trigger_payload,
                 customer=customer_payload
             )
+            if not message.get("body"):
+                continue
             actions.append({
                 "conversation_id": f"conv_{uuid.uuid4().hex[:8]}",
                 "merchant_id": merchant_id,
@@ -1023,6 +1042,7 @@ class ReplyRequest(BaseModel):
 
 @app.post("/v1/reply")
 async def handle_reply(req: ReplyRequest):
+    history: list[dict[str, Any]] = []
     merchant_data = _context_store["merchant"].get(req.merchant_id)
     if merchant_data:
         history = merchant_data["payload"].setdefault("conversation_history", [])

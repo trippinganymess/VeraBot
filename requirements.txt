@@ -9,3 +9,4 @@ numpy
 fastapi
 uvicorn
 anyio
+httpx

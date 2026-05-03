@@ -6,18 +6,12 @@ brittle regex patterns.  The underlying model is ``BAAI/bge-m3``,
 a multilingual model with excellent support for English, Hindi, and transliterated
 Indian languages, producing highly discriminative sentence embeddings.
 
-Usage::
-
-    from semantic_matcher import semantic_matcher
-    is_auto = semantic_matcher.is_auto_reply("Thank you for contacting us")
-    is_intent = semantic_matcher.is_intent_transition("haan karo shuru karo")
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from functools import lru_cache
 from typing import Sequence
 
 import numpy as np
@@ -113,57 +107,86 @@ INTENT_TRANSITION_ANCHORS: list[str] = [
 ]
 
 
+def _normalize(matrix: np.ndarray) -> np.ndarray:
+    """L2-normalize each row of a 2-D array in place and return it."""
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)  # avoid division by zero
+    return matrix / norms
+
+
 class SemanticMatcher:
     """Lazy-loaded semantic similarity engine for message classification.
 
-    The model is loaded on first use and cached for the lifetime of the
-    process.  Anchor embeddings are pre-computed once and stored as
+    Embeddings are fetched from the Hugging Face Inference API via
+    ``InferenceClient`` — no model weights are loaded locally.
+    Anchor embeddings are pre-computed once at first use and stored as
     normalised numpy arrays for fast cosine-similarity via dot-product.
     """
 
     def __init__(self) -> None:
-        self._model = None
+        self._client = None          # huggingface_hub.InferenceClient
         self._auto_reply_embeddings: np.ndarray | None = None
         self._intent_embeddings: np.ndarray | None = None
         self._cache: dict[str, str] = {}
 
+    # -- helpers ------------------------------------------------------------
+
+    def _embed(self, texts: list[str]) -> np.ndarray:
+        """Return a normalised (N, D) embedding matrix for *texts*.
+
+        Calls the HF Inference API and normalises the result so that
+        cosine similarity reduces to a dot product.
+        """
+        raw = self._client.feature_extraction(texts, model=_MODEL_NAME)
+        matrix = np.array(raw, dtype=np.float32)
+        # feature_extraction may return (N, D) or (N, 1, D) depending on
+        # the model revision — squeeze any extra middle dimension.
+        if matrix.ndim == 3:
+            matrix = matrix[:, 0, :]
+        return _normalize(matrix)
+
     # -- lazy init ----------------------------------------------------------
 
     def _ensure_loaded(self) -> None:
-        """Load the sentence-transformer model and pre-compute anchor embeddings."""
-        if self._model is not None:
+        """Initialise the InferenceClient and pre-compute anchor embeddings."""
+        if self._client is not None:
             return
 
-        # Skip model loading if NO_LLM is set (for fast deterministic tests)
+        # Skip client creation if NO_LLM is set (for fast deterministic tests)
         if os.getenv("NO_LLM") == "1":
-            logger.info("NO_LLM=1 — skipping semantic matcher model load")
+            logger.info("NO_LLM=1 — skipping semantic matcher client init")
             return
 
         try:
-            from sentence_transformers import SentenceTransformer
+            from huggingface_hub import InferenceClient
 
-            logger.info("Loading semantic matcher model: %s", _MODEL_NAME)
-            self._model = SentenceTransformer(_MODEL_NAME)
+            hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+            logger.info(
+                "Initialising HF InferenceClient for model: %s", _MODEL_NAME
+            )
+            self._client = InferenceClient(token=hf_token)
 
-            self._auto_reply_embeddings = self._model.encode(
-                AUTO_REPLY_ANCHORS, normalize_embeddings=True
-            )
-            self._intent_embeddings = self._model.encode(
-                INTENT_TRANSITION_ANCHORS, normalize_embeddings=True
-            )
+            logger.info("Pre-computing auto-reply anchor embeddings via HF API…")
+            self._auto_reply_embeddings = self._embed(AUTO_REPLY_ANCHORS)
+
+            logger.info("Pre-computing intent-transition anchor embeddings via HF API…")
+            self._intent_embeddings = self._embed(INTENT_TRANSITION_ANCHORS)
+
             logger.info(
                 "Semantic matcher ready — %d auto-reply anchors, %d intent anchors",
                 len(AUTO_REPLY_ANCHORS),
                 len(INTENT_TRANSITION_ANCHORS),
             )
         except Exception:
-            logger.exception("Failed to load semantic matcher; falling back to regex")
-            self._model = None
+            logger.exception(
+                "Failed to initialise HF InferenceClient; falling back to regex"
+            )
+            self._client = None
 
-    def get_intent_type(self, message: str, llm_client=None) -> Literal["auto_reply", "intent_transition", "none"]:
+    def get_intent_type(self, message: str, llm_client=None) -> str:
         """Classify message as auto-reply, intent-transition, or none.
-        
-        Strict pipeline: Regex -> BGE-M3 -> Gemma-3 LLM.
+
+        Strict pipeline: Regex -> BGE-M3 (via HF Inference API) -> Gemma-3 LLM.
         Moves to the next stage only if the previous yields no clear classification.
         """
         if message in self._cache:
@@ -180,16 +203,25 @@ class SemanticMatcher:
             self._cache[message] = ans
             return ans
 
-        # Stage 2: Semantic Similarity (BGE-M3)
+        # Stage 2: Semantic Similarity (BGE-M3 via HF InferenceClient)
         self._ensure_loaded()
-        if self._model is None or self._auto_reply_embeddings is None or self._intent_embeddings is None:
+        if (
+            self._client is None
+            or self._auto_reply_embeddings is None
+            or self._intent_embeddings is None
+        ):
             return "none"
 
-        emb = self._model.encode([message], normalize_embeddings=True)
+        emb = self._embed([message])  # shape (1, D), already normalised
         auto_sim = float(np.max(emb @ self._auto_reply_embeddings.T))
         intent_sim = float(np.max(emb @ self._intent_embeddings.T))
-        
-        logger.debug("Classification scores for %r: auto=%.3f, intent=%.3f", message[:60], auto_sim, intent_sim)
+
+        logger.debug(
+            "Classification scores for %r: auto=%.3f, intent=%.3f",
+            message[:60],
+            auto_sim,
+            intent_sim,
+        )
 
         is_auto = auto_sim >= AUTO_REPLY_THRESHOLD
         is_intent = intent_sim >= INTENT_TRANSITION_THRESHOLD
@@ -202,8 +234,7 @@ class SemanticMatcher:
         elif is_intent:
             ans = "intent_transition"
         else:
-            # Neither met the threshold. The user requested LLM fallback with temperature=0.
-            # No guessing allowed. 
+            # Neither met the threshold — fall back to LLM if available.
             if llm_client is not None and os.getenv("NO_LLM") != "1":
                 prompt = f'''Classify the following merchant message into EXACTLY ONE of these categories:
 - intent (Explicitly expressing interest, agreeing to proceed, or asking to sign up/join the offer)
@@ -218,9 +249,9 @@ Message: "{message}"'''
                 try:
                     from google.genai import types
                     response = llm_client.models.generate_content(
-                        model="gemma-3-12b-it", # Strictly using Gemma 3 12B as requested
+                        model="gemma-3-12b-it",
                         contents=prompt,
-                        config=types.GenerateContentConfig(temperature=0.0)
+                        config=types.GenerateContentConfig(temperature=0.0),
                     )
                     if response.text:
                         res = response.text.strip().lower()
@@ -231,7 +262,8 @@ Message: "{message}"'''
                 except Exception as e:
                     logger.warning("LLM fallback classification failed: %s", e)
 
-        # Cache to prevent double evaluation (especially LLM calls) when bot.py calls both is_auto_reply and is_intent_transition
+        # Cache to prevent double evaluation (especially LLM calls) when
+        # bot.py calls both is_auto_reply and is_intent_transition.
         if len(self._cache) > 1000:
             self._cache.clear()
         self._cache[message] = ans
@@ -248,14 +280,14 @@ Message: "{message}"'''
     def classify(self, message: str) -> tuple[float, float]:
         """Return (auto_reply_score, intent_score) for diagnostics.
 
-        Both values are in [0, 1].  Returns (0.0, 0.0) if the model
+        Both values are in [0, 1].  Returns (0.0, 0.0) if the client
         is unavailable.
         """
         self._ensure_loaded()
-        if self._model is None:
+        if self._client is None:
             return 0.0, 0.0
 
-        emb = self._model.encode([message], normalize_embeddings=True)
+        emb = self._embed([message])
         auto_sim = float(np.max(emb @ self._auto_reply_embeddings.T))
         intent_sim = float(np.max(emb @ self._intent_embeddings.T))
         return auto_sim, intent_sim

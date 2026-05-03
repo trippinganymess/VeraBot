@@ -205,14 +205,14 @@ class SemanticMatcher:
             # Neither met the threshold. The user requested LLM fallback with temperature=0.
             # No guessing allowed. 
             if llm_client is not None and os.getenv("NO_LLM") != "1":
-                prompt = f'''Classify the following message into EXACTLY ONE of these categories:
-- intent
-- auto-reply
-- neither
+                prompt = f'''Classify the following merchant message into EXACTLY ONE of these categories:
+- intent (Explicitly expressing interest, agreeing to proceed, or asking to sign up/join the offer)
+- auto-reply (An automated out-of-office, mailbox unmonitored, or automated ticket response)
+- neither (General chatter, questions about other topics, hostility, or anything else)
 
 Rules:
-1. Return ONLY the category name. No other text.
-2. No guessing.
+1. Return ONLY the exact category name ("intent", "auto-reply", or "neither"). No other text.
+2. No guessing. If unsure, output neither.
 
 Message: "{message}"'''
                 try:

@@ -80,9 +80,9 @@ class TestJudgeSimulatorAPI(unittest.TestCase):
         response = self.client.post("/v1/context", json=payload)
         self.assertEqual(response.status_code, 409)
         data = response.json()
-        self.assertFalse(data["detail"]["accepted"])
-        self.assertEqual(data["detail"]["reason"], "stale_version")
-        self.assertEqual(data["detail"]["current_version"], 2)
+        self.assertFalse(data["accepted"])
+        self.assertEqual(data["reason"], "stale_version")
+        self.assertEqual(data["current_version"], 2)
 
     def test_tick_empty_when_no_triggers(self):
         response = self.client.post("/v1/tick", json={"now": "2026-04-26T10:35:00Z", "available_triggers": []})

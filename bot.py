@@ -669,44 +669,36 @@ def _build_llm_prompt(
     draft_body: str,
     draft_rationale: str,
 ) -> str:
-    """Assemble the final LLM prompt from modular template pieces.
-
-    Combines the constant SYSTEM_PROMPT, a lever-specific template
-    fragment, the JIT-extracted facts, and the rule-engine draft.
-    This avoids dumping entire context objects into the prompt.
-
-    Args:
-        lever: The compulsion lever to use for framing.
-        language_pref: Language preference string (e.g. "en", "hi-en mix").
-        cta: Desired CTA mode for the output.
-        send_as: Sender attribution role.
-        facts: Minimal fact dict from _extract_jit_facts.
-        draft_body: Rule-engine pre-composed message body.
-        draft_rationale: Rule-engine pre-composed rationale.
-
-    Returns:
-        A complete prompt string ready for the LLM.
-    """
     lever_template = LEVER_TEMPLATES.get(lever, LEVER_TEMPLATES["neutral"])
 
-    language_instruction = ""
-    if language_pref.startswith("hi"):
-        language_instruction = (
-            "Language: Hindi-English code-mix. "
-            "Blend naturally — use Hindi particles (ji, hai, karo) "
-            "with English nouns and numbers.\n"
+    language_instruction = (
+        "Language: Hindi-English code-mix. "
+        "Blend naturally — use Hindi particles (ji, hai, karo) "
+        "with English nouns and numbers.\n"
+        if language_pref.startswith("hi")
+        else "Language: English.\n"
+    )
+
+    # Build conversation block BEFORE the f-string
+    recent = facts.pop("recent_conversation", None)
+    if recent:
+        history_lines = "\n".join(f"  [{e['from']}]: {e['body']}" for e in recent)
+        last_message = recent[-1]["body"] if recent[-1]["from"] == "merchant" else ""
+        conversation_block = (
+            f"\nConversation so far:\n{history_lines}\n"
+            f"\nThe merchant's last message was: \"{last_message}\"\n"
+            "Respond directly to what they said, staying in character as Vera.\n"
         )
     else:
-        language_instruction = "Language: English.\n"
+        conversation_block = ""
 
-    facts_block = "\n".join(
-        f"- {key}: {value}" for key, value in facts.items()
-    )
+    # Build facts block AFTER popping recent_conversation
+    facts_block = "\n".join(f"- {key}: {value}" for key, value in facts.items())
 
     return f"""{SYSTEM_PROMPT}
 
 {lever_template}
-
+{conversation_block}
 {language_instruction}
 Constraints:
 - CTA mode: {cta}

@@ -21,8 +21,21 @@ from functools import lru_cache
 from typing import Sequence
 
 import numpy as np
+import re
 
 logger = logging.getLogger(__name__)
+
+_AUTO_REPLY_REGEX: list[str] = [
+    r"auto[- ]?reply",
+    r"noreply@",
+    r"no-reply@",
+    r"do not reply",
+]
+
+_INTENT_REGEX: list[str] = [
+    r"\b(let'?s do it|sign me up|i want to join|proceed)\b",
+    r"\b(shuru karo|join karna|onboard karna|bharti karo)\b",
+]
 
 # ---------------------------------------------------------------------------
 # Model name — BAAI/bge-m3 for multilingual sentence similarity
@@ -150,12 +163,24 @@ class SemanticMatcher:
     def get_intent_type(self, message: str, llm_client=None) -> Literal["auto_reply", "intent_transition", "none"]:
         """Classify message as auto-reply, intent-transition, or none.
         
-        Evaluates both similarity scores. If both meet their thresholds, the higher
-        score wins. If neither meets the threshold, uses the LLM fallback to classify.
+        Strict pipeline: Regex -> BGE-M3 -> Gemma-3 LLM.
+        Moves to the next stage only if the previous yields no clear classification.
         """
         if message in self._cache:
             return self._cache[message]
 
+        # Stage 1: Fast-path Regex
+        msg_lower = message.lower()
+        if any(re.search(p, msg_lower) for p in _AUTO_REPLY_REGEX):
+            ans = "auto_reply"
+            self._cache[message] = ans
+            return ans
+        if any(re.search(p, message, flags=re.IGNORECASE) for p in _INTENT_REGEX):
+            ans = "intent_transition"
+            self._cache[message] = ans
+            return ans
+
+        # Stage 2: Semantic Similarity (BGE-M3)
         self._ensure_loaded()
         if self._model is None or self._auto_reply_embeddings is None or self._intent_embeddings is None:
             return "none"
@@ -193,7 +218,7 @@ Message: "{message}"'''
                 try:
                     from google.genai import types
                     response = llm_client.models.generate_content(
-                        model="gemini-3.1-flash-lite-preview", # Using standard client model
+                        model="gemma-3-12b-it", # Strictly using Gemma 3 12B as requested
                         contents=prompt,
                         config=types.GenerateContentConfig(temperature=0.0)
                     )

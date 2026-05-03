@@ -53,8 +53,10 @@ class TestSemanticMatcherNoModel(unittest.TestCase):
         original = os.environ.get("NO_LLM")
         os.environ["NO_LLM"] = "1"
         try:
-            self.assertFalse(matcher.is_auto_reply("Thank you for contacting us"))
-            self.assertFalse(matcher.is_intent_transition("lets do it"))
+            # Because regex runs FIRST now, "lets do it" will return True!
+            # We need to test with a string that misses the regex to ensure the model fallback returns False.
+            self.assertFalse(matcher.is_auto_reply("i am busy today"))
+            self.assertFalse(matcher.is_intent_transition("i might consider proceeding later"))
             auto_s, intent_s = matcher.classify("hello")
             self.assertEqual(auto_s, 0.0)
             self.assertEqual(intent_s, 0.0)

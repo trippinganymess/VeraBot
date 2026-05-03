@@ -237,28 +237,12 @@ def _last_merchant_message(conversation_history: list[dict[str, Any]] | None) ->
     return None
 
 
-# Lightweight regex patterns kept as a fast-path for unmistakable signals.
-_AUTO_REPLY_REGEX: list[str] = [
-    r"auto[- ]?reply",
-    r"noreply@",
-    r"no-reply@",
-    r"do not reply",
-]
-
-_INTENT_REGEX: list[str] = [
-    r"\b(let'?s do it|sign me up|i want to join|proceed)\b",
-    r"\b(shuru karo|join karna|onboard karna|bharti karo)\b",
-]
-
-
 def _auto_reply_detected(conversation_history: list[dict[str, Any]] | None) -> bool:
-    """Detect auto-reply messages via semantic similarity (MuRIL) with regex fast-path.
+    """Detect auto-reply messages.
 
-    Detection strategy (in order):
+    Detection strategy:
     1. Repeated identical merchant messages → always auto-reply.
-    2. Regex fast-path for unmistakable canned markers (e.g. 'noreply@').
-    3. Semantic similarity against pre-computed auto-reply anchor embeddings
-       using the MuRIL-based sentence transformer.
+    2. Delegate to semantic_matcher (Regex -> BGE-M3 -> Gemma-3 LLM).
     """
     if not conversation_history:
         return False
@@ -275,32 +259,20 @@ def _auto_reply_detected(conversation_history: list[dict[str, Any]] | None) -> b
         return True
 
     last_message = merchant_messages[-1]
-    last_lower = last_message.lower()
 
-    # Strategy 2: regex fast-path for obvious markers
-    if any(re.search(p, last_lower) for p in _AUTO_REPLY_REGEX):
-        return True
-
-    # Strategy 3: semantic similarity via MuRIL with LLM fallback
+    # Strategy 2: Strict Classification Pipeline
     return semantic_matcher.is_auto_reply(last_message, LLM_CLIENT)
 
 
 def _intent_transition_detected(message: str | None) -> bool:
-    """Detect explicit intent to join or proceed via semantic similarity (MuRIL).
+    """Detect explicit intent to join or proceed.
 
-    Detection strategy (in order):
-    1. Regex fast-path for unambiguous English/Hindi keywords.
-    2. Semantic similarity against pre-computed intent anchor embeddings
-       using the MuRIL-based sentence transformer.
+    Detection strategy:
+    Delegate to semantic_matcher (Regex -> BGE-M3 -> Gemma-3 LLM).
     """
     if not message:
         return False
 
-    # Strategy 1: regex fast-path
-    if any(re.search(p, message, flags=re.IGNORECASE) for p in _INTENT_REGEX):
-        return True
-
-    # Strategy 2: semantic similarity via MuRIL with LLM fallback
     return semantic_matcher.is_intent_transition(message, LLM_CLIENT)
 
 

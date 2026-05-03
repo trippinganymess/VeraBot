@@ -1104,6 +1104,12 @@ async def metadata():
         "submitted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }
 
+@app.post("/v1/teardown")
+async def teardown():
+    for scope in _context_store:
+        _context_store[scope].clear()
+    return {"status": "ok", "message": "State wiped"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)

@@ -6,18 +6,32 @@ brittle regex patterns.  The underlying model is ``BAAI/bge-m3``,
 a multilingual model with excellent support for English, Hindi, and transliterated
 Indian languages, producing highly discriminative sentence embeddings.
 
+Classification pipeline per message:
+    Stage 1 — Fast-path Regex  (zero latency)
+    Stage 2 — BGE-M3 semantic similarity via HF InferenceClient
+    Stage 3 — Gemma-3 LLM fallback (only when Stage 2 is inconclusive)
+
+Possible return values from get_intent_type:
+    "auto_reply"        — canned/automated response, end conversation
+    "intent_transition" — merchant explicitly wants to proceed/join
+    "hostile"           — merchant is annoyed, wants to stop
+    "wait"              — merchant needs time, back off
+    "neither"           — live conversation, route to main bot
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Sequence
 
 import numpy as np
 import re
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Fast-path regex patterns (Stage 1)
+# ---------------------------------------------------------------------------
 
 _AUTO_REPLY_REGEX: list[str] = [
     r"auto[- ]?reply",
@@ -31,23 +45,34 @@ _INTENT_REGEX: list[str] = [
     r"\b(shuru karo|join karna|onboard karna|bharti karo)\b",
 ]
 
+_HOSTILE_REGEX: list[str] = [
+    r"\b(stop|unsubscribe|remove me|block|spam|not interested|useless|bakwaas)\b",
+    r"\b(band karo|hatao|mat bhejo|nahi chahiye|disturb mat karo)\b",
+]
+
+_WAIT_REGEX: list[str] = [
+    r"\b(baad mein|thodi der|give me time|not now|not ready|call later|abhi nahi)\b",
+    r"\b(busy hoon|free nahi|thoda wait|baat baad mein)\b",
+]
+
 # ---------------------------------------------------------------------------
-# Model name — BAAI/bge-m3 for multilingual sentence similarity
+# Model name
 # ---------------------------------------------------------------------------
 _MODEL_NAME = "BAAI/bge-m3"
 
 # ---------------------------------------------------------------------------
-# Similarity thresholds (tuned from empirical testing)
+# Similarity thresholds
 # ---------------------------------------------------------------------------
 AUTO_REPLY_THRESHOLD = 0.75
 INTENT_TRANSITION_THRESHOLD = 0.65
+HOSTILE_THRESHOLD = 0.70
+WAIT_THRESHOLD = 0.68
 
 # ---------------------------------------------------------------------------
-# Anchor phrases — the semantic "centers" for each category
+# Anchor phrases
 # ---------------------------------------------------------------------------
 
 AUTO_REPLY_ANCHORS: list[str] = [
-    # English auto-reply patterns
     "thank you for contacting us, we will get back to you shortly",
     "this is an automated reply, our team will respond soon",
     "we have received your message and will get back to you",
@@ -61,7 +86,6 @@ AUTO_REPLY_ANCHORS: list[str] = [
     "please expect a delay in our response",
     "for urgent matters please call our helpline",
     "this is an auto-generated confirmation of your message",
-    # Hindi / Hinglish auto-reply patterns
     "sampark karne ke liye dhanyawad, hum jald hi jawab denge",
     "aapka message mil gaya hai, hum jald reply karenge",
     "hum jald hi aapse sampark karenge",
@@ -78,7 +102,6 @@ AUTO_REPLY_ANCHORS: list[str] = [
 ]
 
 INTENT_TRANSITION_ANCHORS: list[str] = [
-    # English intent-to-proceed patterns
     "lets do it, what is the next step",
     "I want to join, sign me up please",
     "ok proceed with it, i am ready to start",
@@ -91,7 +114,6 @@ INTENT_TRANSITION_ANCHORS: list[str] = [
     "sounds good, count me in",
     "I want this, please register me",
     "let us start the onboarding process",
-    # Hindi / Hinglish intent patterns
     "haan karo, shuru karo abhi",
     "join karna hai mujhe, aage batao",
     "haan bilkul, mujhe register karo",
@@ -106,11 +128,61 @@ INTENT_TRANSITION_ANCHORS: list[str] = [
     "chaliye shuru karte hain",
 ]
 
+HOSTILE_ANCHORS: list[str] = [
+    # English hostile patterns
+    "please stop messaging me, I am not interested",
+    "remove me from your list, do not contact me again",
+    "this is spam, stop sending me messages",
+    "I want to unsubscribe, do not message me",
+    "stop bothering me, I do not want this service",
+    "this is useless, please do not contact me again",
+    "I am reporting this as spam",
+    "block this number, do not call again",
+    "not interested at all, stop this immediately",
+    "leave me alone, I never asked for this",
+    # Hindi / Hinglish hostile patterns
+    "band karo yeh messages, mujhe nahi chahiye",
+    "mujhe mat bhejo, main interested nahi hoon",
+    "yeh bakwaas band karo, mujhe disturb mat karo",
+    "hatao mujhe is list se, dobara mat bhejo",
+    "mujhe block karo, yeh spam hai",
+    "nahi chahiye yeh service, please rokiye",
+    "bahut ho gaya, ab mat karo contact",
+    "pareshan mat karo, bilkul interest nahi",
+    "yeh faltu hai, dobara mat likhna",
+    "main complaint karunga agar dobara message aaya",
+]
+
+WAIT_ANCHORS: list[str] = [
+    # English wait patterns
+    "I am busy right now, please check back later",
+    "not the right time, can we talk later",
+    "give me some time to think about it",
+    "I will get back to you, just need some time",
+    "call me later, I am in a meeting",
+    "not ready yet, let us talk next week",
+    "busy at the moment, message me later",
+    "I need more time to decide, will let you know",
+    "check back with me in a few days",
+    "remind me later, right now is not a good time",
+    # Hindi / Hinglish wait patterns
+    "abhi busy hoon, baad mein baat karte hain",
+    "abhi time nahi hai, thodi der baad call karo",
+    "sochne do mujhe, baad mein batata hoon",
+    "meeting mein hoon, baad mein contact karo",
+    "thoda time chahiye, main khud call karunga",
+    "abhi nahi, kal baat karte hain",
+    "free nahi hoon abhi, thodi der mein",
+    "baad mein dekh lete hain yeh sab",
+    "abhi mat karo, kuch din baad aana",
+    "busy schedule hai, next week try karo",
+]
+
 
 def _normalize(matrix: np.ndarray) -> np.ndarray:
-    """L2-normalize each row of a 2-D array in place and return it."""
+    """L2-normalize each row of a 2-D array and return it."""
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1.0, norms)  # avoid division by zero
+    norms = np.where(norms == 0, 1.0, norms)
     return matrix / norms
 
 
@@ -118,29 +190,25 @@ class SemanticMatcher:
     """Lazy-loaded semantic similarity engine for message classification.
 
     Embeddings are fetched from the Hugging Face Inference API via
-    ``InferenceClient`` — no model weights are loaded locally.
+    InferenceClient — no model weights are loaded locally.
     Anchor embeddings are pre-computed once at first use and stored as
     normalised numpy arrays for fast cosine-similarity via dot-product.
     """
 
     def __init__(self) -> None:
-        self._client = None          # huggingface_hub.InferenceClient
+        self._client = None
         self._auto_reply_embeddings: np.ndarray | None = None
         self._intent_embeddings: np.ndarray | None = None
+        self._hostile_embeddings: np.ndarray | None = None
+        self._wait_embeddings: np.ndarray | None = None
         self._cache: dict[str, str] = {}
 
     # -- helpers ------------------------------------------------------------
 
     def _embed(self, texts: list[str]) -> np.ndarray:
-        """Return a normalised (N, D) embedding matrix for *texts*.
-
-        Calls the HF Inference API and normalises the result so that
-        cosine similarity reduces to a dot product.
-        """
+        """Return a normalised (N, D) embedding matrix for *texts*."""
         raw = self._client.feature_extraction(texts, model=_MODEL_NAME)
         matrix = np.array(raw, dtype=np.float32)
-        # feature_extraction may return (N, D) or (N, 1, D) depending on
-        # the model revision — squeeze any extra middle dimension.
         if matrix.ndim == 3:
             matrix = matrix[:, 0, :]
         return _normalize(matrix)
@@ -148,11 +216,10 @@ class SemanticMatcher:
     # -- lazy init ----------------------------------------------------------
 
     def _ensure_loaded(self) -> None:
-        """Initialise the InferenceClient and pre-compute anchor embeddings."""
+        """Initialise the InferenceClient and pre-compute all anchor embeddings."""
         if self._client is not None:
             return
 
-        # Skip client creation if NO_LLM is set (for fast deterministic tests)
         if os.getenv("NO_LLM") == "1":
             logger.info("NO_LLM=1 — skipping semantic matcher client init")
             return
@@ -161,136 +228,184 @@ class SemanticMatcher:
             from huggingface_hub import InferenceClient
 
             hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
-            logger.info(
-                "Initialising HF InferenceClient for model: %s", _MODEL_NAME
-            )
+            logger.info("Initialising HF InferenceClient for model: %s", _MODEL_NAME)
             self._client = InferenceClient(token=hf_token)
 
-            logger.info("Pre-computing auto-reply anchor embeddings via HF API…")
+            logger.info("Pre-computing anchor embeddings via HF API…")
             self._auto_reply_embeddings = self._embed(AUTO_REPLY_ANCHORS)
-
-            logger.info("Pre-computing intent-transition anchor embeddings via HF API…")
             self._intent_embeddings = self._embed(INTENT_TRANSITION_ANCHORS)
+            self._hostile_embeddings = self._embed(HOSTILE_ANCHORS)
+            self._wait_embeddings = self._embed(WAIT_ANCHORS)
 
             logger.info(
-                "Semantic matcher ready — %d auto-reply anchors, %d intent anchors",
+                "Semantic matcher ready — %d auto-reply, %d intent, %d hostile, %d wait anchors",
                 len(AUTO_REPLY_ANCHORS),
                 len(INTENT_TRANSITION_ANCHORS),
+                len(HOSTILE_ANCHORS),
+                len(WAIT_ANCHORS),
             )
         except Exception:
-            logger.exception(
-                "Failed to initialise HF InferenceClient; falling back to regex"
-            )
+            logger.exception("Failed to initialise HF InferenceClient; falling back to regex")
             self._client = None
 
-    def get_intent_type(self, message: str, llm_client=None) -> str:
-        """Classify message as auto-reply, intent-transition, or none.
+    # -- classification -----------------------------------------------------
 
-        Strict pipeline: Regex -> BGE-M3 (via HF Inference API) -> Gemma-3 LLM.
-        Moves to the next stage only if the previous yields no clear classification.
+    def get_intent_type(self, message: str, llm_client=None) -> str:
+        """Classify a merchant message into one of five categories.
+
+        Returns one of: "auto_reply", "intent_transition", "hostile",
+        "wait", "neither".
+
+        Pipeline:
+            Stage 1 — Fast-path regex  (zero latency)
+            Stage 2 — BGE-M3 semantic similarity via HF InferenceClient
+            Stage 3 — Gemma-3 LLM fallback (only when Stage 2 is inconclusive)
         """
         if message in self._cache:
             return self._cache[message]
 
+        # ------------------------------------------------------------------
         # Stage 1: Fast-path Regex
+        # ------------------------------------------------------------------
         msg_lower = message.lower()
-        if any(re.search(p, msg_lower) for p in _AUTO_REPLY_REGEX):
-            ans = "auto_reply"
-            self._cache[message] = ans
-            return ans
-        if any(re.search(p, message, flags=re.IGNORECASE) for p in _INTENT_REGEX):
-            ans = "intent_transition"
-            self._cache[message] = ans
-            return ans
 
+        if any(re.search(p, msg_lower) for p in _AUTO_REPLY_REGEX):
+            return self._cache_and_return(message, "auto_reply")
+        if any(re.search(p, message, flags=re.IGNORECASE) for p in _INTENT_REGEX):
+            return self._cache_and_return(message, "intent_transition")
+        if any(re.search(p, msg_lower) for p in _HOSTILE_REGEX):
+            return self._cache_and_return(message, "hostile")
+        if any(re.search(p, msg_lower) for p in _WAIT_REGEX):
+            return self._cache_and_return(message, "wait")
+
+        # ------------------------------------------------------------------
         # Stage 2: Semantic Similarity (BGE-M3 via HF InferenceClient)
+        # ------------------------------------------------------------------
         self._ensure_loaded()
         if (
             self._client is None
             or self._auto_reply_embeddings is None
             or self._intent_embeddings is None
+            or self._hostile_embeddings is None
+            or self._wait_embeddings is None
         ):
-            return "none"
+            return "neither"
 
         emb = self._embed([message])  # shape (1, D), already normalised
-        auto_sim = float(np.max(emb @ self._auto_reply_embeddings.T))
-        intent_sim = float(np.max(emb @ self._intent_embeddings.T))
+
+        auto_sim    = float(np.max(emb @ self._auto_reply_embeddings.T))
+        intent_sim  = float(np.max(emb @ self._intent_embeddings.T))
+        hostile_sim = float(np.max(emb @ self._hostile_embeddings.T))
+        wait_sim    = float(np.max(emb @ self._wait_embeddings.T))
 
         logger.debug(
-            "Classification scores for %r: auto=%.3f, intent=%.3f",
-            message[:60],
-            auto_sim,
-            intent_sim,
+            "Scores for %r: auto=%.3f intent=%.3f hostile=%.3f wait=%.3f",
+            message[:60], auto_sim, intent_sim, hostile_sim, wait_sim,
         )
 
-        is_auto = auto_sim >= AUTO_REPLY_THRESHOLD
-        is_intent = intent_sim >= INTENT_TRANSITION_THRESHOLD
+        # Map each category to (score, threshold) then pick the highest
+        # scoring category that clears its threshold.
+        candidates: dict[str, tuple[float, float]] = {
+            "auto_reply":        (auto_sim,    AUTO_REPLY_THRESHOLD),
+            "intent_transition": (intent_sim,  INTENT_TRANSITION_THRESHOLD),
+            "hostile":           (hostile_sim, HOSTILE_THRESHOLD),
+            "wait":              (wait_sim,    WAIT_THRESHOLD),
+        }
 
-        ans = "none"
-        if is_auto and is_intent:
-            ans = "auto_reply" if auto_sim >= intent_sim else "intent_transition"
-        elif is_auto:
-            ans = "auto_reply"
-        elif is_intent:
-            ans = "intent_transition"
-        else:
-            # Neither met the threshold — fall back to LLM if available.
-            if llm_client is not None and os.getenv("NO_LLM") != "1":
-                prompt = f'''Classify the following merchant message into EXACTLY ONE of these categories:
-- intent (Explicitly expressing interest, agreeing to proceed, or asking to sign up/join the offer)
-- auto-reply (An automated out-of-office, mailbox unmonitored, or automated ticket response)
-- neither (General chatter, questions about other topics, hostility, or anything else)
+        cleared = {
+            label: score
+            for label, (score, threshold) in candidates.items()
+            if score >= threshold
+        }
+
+        if cleared:
+            # Highest score wins when multiple thresholds are cleared
+            ans = max(cleared, key=lambda l: cleared[l])
+            return self._cache_and_return(message, ans)
+
+        # ------------------------------------------------------------------
+        # Stage 3: LLM fallback — only fires when BGE-M3 is inconclusive
+        # ------------------------------------------------------------------
+        logger.warning(
+            "BGE-M3 below threshold for %r — "
+            "auto=%.3f intent=%.3f hostile=%.3f wait=%.3f; hitting LLM fallback",
+            message[:80], auto_sim, intent_sim, hostile_sim, wait_sim,
+        )
+
+        ans = "neither"
+        if llm_client is not None and os.getenv("NO_LLM") != "1":
+            prompt = f'''Classify the following merchant message into EXACTLY ONE of these categories:
+- intent (Explicitly expressing interest, agreeing to proceed, or asking to sign up/join)
+- auto-reply (Automated out-of-office, unmonitored mailbox, or automated ticket response)
+- hostile (Merchant is annoyed, wants to stop receiving messages, asks to unsubscribe)
+- wait (Merchant needs time, is busy, asks to be contacted later)
+- neither (General questions, providing context, or anything else)
 
 Rules:
-1. Return ONLY the exact category name ("intent", "auto-reply", or "neither"). No other text.
+1. Return ONLY the exact category name. No other text.
 2. No guessing. If unsure, output neither.
 
 Message: "{message}"'''
-                try:
-                    from google.genai import types
-                    response = llm_client.models.generate_content(
-                        model="gemma-3-12b-it",
-                        contents=prompt,
-                        config=types.GenerateContentConfig(temperature=0.0),
-                    )
-                    if response.text:
-                        res = response.text.strip().lower()
-                        if "auto-reply" in res:
-                            ans = "auto_reply"
-                        elif "intent" in res:
-                            ans = "intent_transition"
-                except Exception as e:
-                    logger.warning("LLM fallback classification failed: %s", e)
+            try:
+                from google.genai import types
+                response = llm_client.models.generate_content(
+                    model="gemma-3-12b-it",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=0.0),
+                )
+                if response.text:
+                    res = response.text.strip().lower()
+                    if "auto-reply" in res:
+                        ans = "auto_reply"
+                    elif "intent" in res:
+                        ans = "intent_transition"
+                    elif "hostile" in res:
+                        ans = "hostile"
+                    elif "wait" in res:
+                        ans = "wait"
+            except Exception as e:
+                logger.warning("LLM fallback classification failed: %s", e)
 
-        # Cache to prevent double evaluation (especially LLM calls) when
-        # bot.py calls both is_auto_reply and is_intent_transition.
+        return self._cache_and_return(message, ans)
+
+    def _cache_and_return(self, message: str, ans: str) -> str:
+        """Store result in cache and return it."""
         if len(self._cache) > 1000:
             self._cache.clear()
         self._cache[message] = ans
         return ans
 
+    # -- convenience wrappers -----------------------------------------------
+
     def is_auto_reply(self, message: str, llm_client=None) -> bool:
-        """Return True if message is classified as auto-reply."""
         return self.get_intent_type(message, llm_client) == "auto_reply"
 
     def is_intent_transition(self, message: str, llm_client=None) -> bool:
-        """Return True if message is classified as intent-transition."""
         return self.get_intent_type(message, llm_client) == "intent_transition"
 
-    def classify(self, message: str) -> tuple[float, float]:
-        """Return (auto_reply_score, intent_score) for diagnostics.
+    def is_hostile(self, message: str, llm_client=None) -> bool:
+        return self.get_intent_type(message, llm_client) == "hostile"
 
-        Both values are in [0, 1].  Returns (0.0, 0.0) if the client
-        is unavailable.
+    def is_wait(self, message: str, llm_client=None) -> bool:
+        return self.get_intent_type(message, llm_client) == "wait"
+
+    def classify(self, message: str) -> dict[str, float]:
+        """Return all four similarity scores for diagnostics.
+
+        Returns a dict with keys: auto_reply, intent, hostile, wait.
+        All values are in [0, 1]. Returns zeros if client is unavailable.
         """
         self._ensure_loaded()
         if self._client is None:
-            return 0.0, 0.0
+            return {"auto_reply": 0.0, "intent": 0.0, "hostile": 0.0, "wait": 0.0}
 
         emb = self._embed([message])
-        auto_sim = float(np.max(emb @ self._auto_reply_embeddings.T))
-        intent_sim = float(np.max(emb @ self._intent_embeddings.T))
-        return auto_sim, intent_sim
+        return {
+            "auto_reply": float(np.max(emb @ self._auto_reply_embeddings.T)),
+            "intent":     float(np.max(emb @ self._intent_embeddings.T)),
+            "hostile":    float(np.max(emb @ self._hostile_embeddings.T)),
+            "wait":       float(np.max(emb @ self._wait_embeddings.T)),
+        }
 
 
 # Module-level singleton — lazy, thread-safe via GIL

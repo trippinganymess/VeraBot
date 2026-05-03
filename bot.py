@@ -17,6 +17,8 @@ from fastapi.responses import JSONResponse
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field, model_validator
+from datetime import datetime, timezone
+import time
 
 from semantic_matcher import semantic_matcher
 
@@ -1072,63 +1074,72 @@ class ReplyRequest(BaseModel):
 
 @app.post("/v1/reply")
 async def handle_reply(req: ReplyRequest):
-    history: list[dict[str, Any]] = []
+
+    # Guard: only act on merchant messages
+    if req.from_role != "merchant":
+        return {"action": "noop", "rationale": "Non-merchant message, no action needed"}
+
+    # Fail fast if merchant context is missing — nothing useful can be done
     merchant_data = _context_store["merchant"].get(req.merchant_id)
-    if merchant_data:
-        history = merchant_data["payload"].setdefault("conversation_history", [])
-        history.append({"from": req.from_role, "body": req.message})
-        
-        # Check auto-reply from 4 auto-replies
-        merchant_messages = [e.get("body", "") for e in history if e.get("from") == "merchant"]
-        if len(merchant_messages) >= 4 and len(set(merchant_messages[-4:])) == 1:
-            return {
-                "action": "end",
-                "rationale": "Auto-reply loop detected, ending conversation"
-            }
+    if not merchant_data:
+        return {"action": "noop", "rationale": "Merchant context not found"}
 
-    message_text = req.message.lower()
-    
-    # Hostile Handling
-    if "stop" in message_text or "spam" in message_text or "not interested" in message_text or "useless" in message_text:
-        return {
-            "action": "end",
-            "rationale": "Merchant is hostile; gracefully exiting conversation"
-        }
-        
-    # Wait intent
-    if "wait" in message_text or "not ready" in message_text or "time" in message_text:
-        return {
-            "action": "wait",
-            "wait_seconds": 1800,
-            "rationale": "Merchant asked for time; back off 30 min"
-        }
-
+    # Single semantic classification
     intent_type = await _intent_type_async(req.message)
 
-    if intent_type == "auto_reply" or await _auto_reply_detected_async(history):
-        return {
-            "action": "end",
-            "rationale": "Merchant appears to be an auto-responder; aborting"
-        }
+    # Hostile exits before touching history
+    if intent_type == "hostile":
+        return {"action": "end", "rationale": "Merchant is hostile; gracefully exiting"}
+
+    # Append to history after hostile check
+    history = merchant_data["payload"].setdefault("conversation_history", [])
+    history.append({"from": req.from_role, "body": req.message})
+
+    # Hard auto-reply loop guard
+    merchant_messages = [e.get("body", "") for e in history if e.get("from") == "merchant"]
+    if len(merchant_messages) >= 4 and len(set(merchant_messages[-4:])) == 1:
+        return {"action": "end", "rationale": "Auto-reply loop detected"}
+
+    # Route by intent type
+    if intent_type == "auto_reply":
+        return {"action": "end", "rationale": "Auto-responder detected; aborting"}
+
+    if intent_type == "wait":
+        return {"action": "wait", "wait_seconds": 1800, "rationale": "Merchant needs time; backing off 30 minutes"}
 
     if intent_type == "intent_transition":
-        return {
-            "action": "send",
-            "body": "Got it! Let's proceed with the details.",
-            "cta": "open_ended",
-            "rationale": "Acknowledged intent to proceed"
-        }
-        
-    # Catch-all for "neither" - for now, just acknowledge and proceed or compose a dynamic response
-    return {
-        "action": "send",
-        "body": "I understand. Could you share a bit more?",
-        "cta": "open_ended",
-        "rationale": "Continuing conversation for ambiguous intent"
-    }
+        return {"action": "send", "body": "Got it! Let's proceed with the details.", "cta": "open_ended", "rationale": "Acknowledged intent to proceed"}
 
-from datetime import datetime, timezone
-import time
+    # "neither" — route to main compose pipeline
+    merchant_payload = merchant_data["payload"]
+    category_slug = merchant_payload.get("category_slug", "unknown")
+    category_data = _context_store["category"].get(category_slug)
+    category_payload = category_data["payload"] if category_data else {"slug": category_slug}
+
+    customer_payload = None
+    if req.customer_id:
+        customer_data = _context_store["customer"].get(req.customer_id)
+        if customer_data:
+            customer_payload = customer_data["payload"]
+
+    try:
+        composed = await compose_async(
+            category=category_payload,
+            merchant=merchant_payload,
+            trigger={
+                "id": req.conversation_id,
+                "scope": "merchant",
+                "kind": "reply",
+                "source": "reply",
+                "merchant_id": req.merchant_id,
+                "customer_id": req.customer_id,
+            },
+            customer=customer_payload,
+        )
+        return {"action": "send", "body": composed["body"], "cta": composed["cta"], "rationale": composed["rationale"]}
+    except Exception:
+        logger.exception("compose_async failed in /v1/reply")
+        return {"action": "send", "body": "Could you tell me a bit more?", "cta": "open_ended", "rationale": "compose_async error; generic fallback"}
 
 START_TIME = time.time()
 

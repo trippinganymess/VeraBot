@@ -922,6 +922,15 @@ class ContextPush(BaseModel):
     payload: dict[str, Any]
     delivered_at: str
 
+@app.on_event("startup")
+async def startup_event():
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("Eagerly loading semantic matcher model...")
+    # This forces the lazy init to happen during startup
+    semantic_matcher._ensure_loaded()
+    logger.info("Semantic matcher loaded.")
+
 @app.post("/v1/context")
 async def receive_context(push: ContextPush):
     store = _context_store[push.scope]
@@ -1044,8 +1053,15 @@ async def handle_reply(req: ReplyRequest):
             "rationale": "Merchant asked for time; back off 30 min"
         }
 
-    # Intent transition
-    if _intent_transition_detected(req.message):
+    intent_type = semantic_matcher.get_intent_type(req.message, LLM_CLIENT)
+
+    if intent_type == "auto_reply" or _auto_reply_detected(history):
+        return {
+            "action": "end",
+            "rationale": "Merchant appears to be an auto-responder; aborting"
+        }
+
+    if intent_type == "intent_transition":
         return {
             "action": "send",
             "body": "Got it! Let's proceed with the details.",
@@ -1053,11 +1069,12 @@ async def handle_reply(req: ReplyRequest):
             "rationale": "Acknowledged intent to proceed"
         }
         
+    # Catch-all for "neither" - for now, just acknowledge and proceed or compose a dynamic response
     return {
         "action": "send",
-        "body": "Got it! Let's proceed with the details.",
+        "body": "I understand. Could you share a bit more?",
         "cta": "open_ended",
-        "rationale": "Acknowledged intent to proceed"
+        "rationale": "Continuing conversation for ambiguous intent"
     }
 
 from datetime import datetime, timezone

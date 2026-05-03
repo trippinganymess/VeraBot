@@ -281,8 +281,8 @@ def _auto_reply_detected(conversation_history: list[dict[str, Any]] | None) -> b
     if any(re.search(p, last_lower) for p in _AUTO_REPLY_REGEX):
         return True
 
-    # Strategy 3: semantic similarity via MuRIL
-    return semantic_matcher.is_auto_reply(last_message)
+    # Strategy 3: semantic similarity via MuRIL with LLM fallback
+    return semantic_matcher.is_auto_reply(last_message, LLM_CLIENT)
 
 
 def _intent_transition_detected(message: str | None) -> bool:
@@ -300,8 +300,8 @@ def _intent_transition_detected(message: str | None) -> bool:
     if any(re.search(p, message, flags=re.IGNORECASE) for p in _INTENT_REGEX):
         return True
 
-    # Strategy 2: semantic similarity via MuRIL
-    return semantic_matcher.is_intent_transition(message)
+    # Strategy 2: semantic similarity via MuRIL with LLM fallback
+    return semantic_matcher.is_intent_transition(message, LLM_CLIENT)
 
 
 def _format_pct(value: float) -> str:

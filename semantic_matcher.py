@@ -112,6 +112,7 @@ class SemanticMatcher:
         self._model = None
         self._auto_reply_embeddings: np.ndarray | None = None
         self._intent_embeddings: np.ndarray | None = None
+        self._cache: dict[str, str] = {}
 
     # -- lazy init ----------------------------------------------------------
 
@@ -146,35 +147,78 @@ class SemanticMatcher:
             logger.exception("Failed to load semantic matcher; falling back to regex")
             self._model = None
 
-    # -- public API ---------------------------------------------------------
-
-    def is_auto_reply(self, message: str) -> bool:
-        """Return True if *message* is semantically similar to auto-reply anchors.
-
-        Falls back to False if the model is not loaded (e.g. during tests).
+    def get_intent_type(self, message: str, llm_client=None) -> Literal["auto_reply", "intent_transition", "none"]:
+        """Classify message as auto-reply, intent-transition, or none.
+        
+        Evaluates both similarity scores. If both meet their thresholds, the higher
+        score wins. If neither meets the threshold, uses the LLM fallback to classify.
         """
+        if message in self._cache:
+            return self._cache[message]
+
         self._ensure_loaded()
-        if self._model is None or self._auto_reply_embeddings is None:
-            return False
+        if self._model is None or self._auto_reply_embeddings is None or self._intent_embeddings is None:
+            return "none"
 
         emb = self._model.encode([message], normalize_embeddings=True)
-        max_sim = float(np.max(emb @ self._auto_reply_embeddings.T))
-        logger.debug("auto-reply similarity for %r: %.3f", message[:60], max_sim)
-        return max_sim >= AUTO_REPLY_THRESHOLD
+        auto_sim = float(np.max(emb @ self._auto_reply_embeddings.T))
+        intent_sim = float(np.max(emb @ self._intent_embeddings.T))
+        
+        logger.debug("Classification scores for %r: auto=%.3f, intent=%.3f", message[:60], auto_sim, intent_sim)
 
-    def is_intent_transition(self, message: str) -> bool:
-        """Return True if *message* is semantically similar to intent anchors.
+        is_auto = auto_sim >= AUTO_REPLY_THRESHOLD
+        is_intent = intent_sim >= INTENT_TRANSITION_THRESHOLD
 
-        Falls back to False if the model is not loaded (e.g. during tests).
-        """
-        self._ensure_loaded()
-        if self._model is None or self._intent_embeddings is None:
-            return False
+        ans = "none"
+        if is_auto and is_intent:
+            ans = "auto_reply" if auto_sim >= intent_sim else "intent_transition"
+        elif is_auto:
+            ans = "auto_reply"
+        elif is_intent:
+            ans = "intent_transition"
+        else:
+            # Neither met the threshold. The user requested LLM fallback with temperature=0.
+            # No guessing allowed. 
+            if llm_client is not None and os.getenv("NO_LLM") != "1":
+                prompt = f'''Classify the following message into EXACTLY ONE of these categories:
+- intent
+- auto-reply
+- neither
 
-        emb = self._model.encode([message], normalize_embeddings=True)
-        max_sim = float(np.max(emb @ self._intent_embeddings.T))
-        logger.debug("intent similarity for %r: %.3f", message[:60], max_sim)
-        return max_sim >= INTENT_TRANSITION_THRESHOLD
+Rules:
+1. Return ONLY the category name. No other text.
+2. No guessing.
+
+Message: "{message}"'''
+                try:
+                    from google.genai import types
+                    response = llm_client.models.generate_content(
+                        model="gemini-3.1-flash-lite-preview", # Using standard client model
+                        contents=prompt,
+                        config=types.GenerateContentConfig(temperature=0.0)
+                    )
+                    if response.text:
+                        res = response.text.strip().lower()
+                        if "auto-reply" in res:
+                            ans = "auto_reply"
+                        elif "intent" in res:
+                            ans = "intent_transition"
+                except Exception as e:
+                    logger.warning("LLM fallback classification failed: %s", e)
+
+        # Cache to prevent double evaluation (especially LLM calls) when bot.py calls both is_auto_reply and is_intent_transition
+        if len(self._cache) > 1000:
+            self._cache.clear()
+        self._cache[message] = ans
+        return ans
+
+    def is_auto_reply(self, message: str, llm_client=None) -> bool:
+        """Return True if message is classified as auto-reply."""
+        return self.get_intent_type(message, llm_client) == "auto_reply"
+
+    def is_intent_transition(self, message: str, llm_client=None) -> bool:
+        """Return True if message is classified as intent-transition."""
+        return self.get_intent_type(message, llm_client) == "intent_transition"
 
     def classify(self, message: str) -> tuple[float, float]:
         """Return (auto_reply_score, intent_score) for diagnostics.

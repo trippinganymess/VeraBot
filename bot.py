@@ -9,6 +9,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
+import anyio
+import anyio
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -275,6 +277,33 @@ def _intent_transition_detected(message: str | None) -> bool:
         return False
 
     return semantic_matcher.is_intent_transition(message, LLM_CLIENT)
+
+
+async def _auto_reply_detected_async(
+    conversation_history: list[dict[str, Any]] | None,
+) -> bool:
+    """Async wrapper for auto-reply detection with LLM calls."""
+    return await anyio.to_thread.run_sync(
+        _auto_reply_detected,
+        conversation_history,
+    )
+
+
+async def _intent_transition_detected_async(message: str | None) -> bool:
+    """Async wrapper for intent transition detection with LLM calls."""
+    return await anyio.to_thread.run_sync(
+        _intent_transition_detected,
+        message,
+    )
+
+
+async def _intent_type_async(message: str) -> str:
+    """Async wrapper for intent classification with LLM calls."""
+    return await anyio.to_thread.run_sync(
+        semantic_matcher.get_intent_type,
+        message,
+        LLM_CLIENT,
+    )
 
 
 def _format_pct(value: float) -> str:
@@ -689,17 +718,13 @@ Refine the draft body using the lever template and facts above.
 Return a JSON object with keys: body, cta, send_as, rationale."""
 
 
-def compose(
+async def compose_async(
     category: dict[str, Any],
     merchant: dict[str, Any],
     trigger: dict[str, Any],
     customer: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Hydrate context and return a composed message payload.
-
-   context validation, auto-reply/intent filtering,
-    benchmark/digest anchoring, lever selection, and voice modulation.
-    """
+    """Compose a message payload using async LLM calls."""
     category_ctx: CategoryContext = _validate(CategoryContext, category)
     merchant_ctx: MerchantContext = _validate(MerchantContext, merchant)
     trigger_ctx: TriggerContext = _validate(TriggerContext, trigger)
@@ -727,7 +752,7 @@ def compose(
     benchmark: dict[str, str] = {}
     digest: dict[str, str] | None = None
 
-    if _auto_reply_detected(conversation_history):
+    if await _auto_reply_detected_async(conversation_history):
         strategy = "auto_reply_exit"
         if language_pref.startswith("hi"):
             body = (
@@ -740,7 +765,7 @@ def compose(
                 "I'll connect directly with the owner or manager."
             )
         cta = "none"
-    elif _intent_transition_detected(last_merchant_message):
+    elif await _intent_transition_detected_async(last_merchant_message):
         strategy = "intent_transition"
         if language_pref.startswith("hi"):
             body = (
@@ -861,7 +886,8 @@ def compose(
         )
         if os.getenv("NO_LLM") != "1":
             try:
-                response = LLM_CLIENT.models.generate_content(
+                response = await anyio.to_thread.run_sync(
+                    LLM_CLIENT.models.generate_content,
                     model="gemini-3.1-flash-lite-preview",
                     contents=prompt,
                     config=types.GenerateContentConfig(
@@ -872,9 +898,7 @@ def compose(
                 )
                 if response.text:
                     llm_dict = json.loads(response.text)
-                    llm_dict["suppression_key"] = (
-                        trigger_ctx.suppression_key
-                    )
+                    llm_dict["suppression_key"] = trigger_ctx.suppression_key
                     message_dict = llm_dict
             except Exception:
                 # Fallback to deterministic rule-engine output on LLM error
@@ -901,6 +925,16 @@ def compose(
         },
     )
     return message.model_dump()
+
+
+def compose(
+    category: dict[str, Any],
+    merchant: dict[str, Any],
+    trigger: dict[str, Any],
+    customer: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Sync wrapper around compose_async for compatibility with tests."""
+    return anyio.run(compose_async, category, merchant, trigger, customer)
 
 
 # =============================================================================
@@ -1006,11 +1040,11 @@ async def handle_tick(req: TickRequest):
                 customer_payload = customer_data["payload"]
         
         try:
-            message = compose(
+            message = await compose_async(
                 category=category_payload,
                 merchant=merchant_payload,
                 trigger=trigger_payload,
-                customer=customer_payload
+                customer=customer_payload,
             )
             if not message.get("body"):
                 continue
@@ -1073,9 +1107,9 @@ async def handle_reply(req: ReplyRequest):
             "rationale": "Merchant asked for time; back off 30 min"
         }
 
-    intent_type = semantic_matcher.get_intent_type(req.message, LLM_CLIENT)
+    intent_type = await _intent_type_async(req.message)
 
-    if intent_type == "auto_reply" or _auto_reply_detected(history):
+    if intent_type == "auto_reply" or await _auto_reply_detected_async(history):
         return {
             "action": "end",
             "rationale": "Merchant appears to be an auto-responder; aborting"

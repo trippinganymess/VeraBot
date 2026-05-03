@@ -1,4 +1,4 @@
-*.md
+
 !README.md
 judge_simulator.py
 logs/

@@ -644,7 +644,7 @@ def _extract_jit_facts(
 
     conversation_history = getattr(merchant_ctx, "conversation_history", None)
     if conversation_history:
-        facts["recent_conversation"] = merchant_ctx.conversation_history[-6:]
+        facts["recent_conversation"] = conversation_history[-6:]
 
     # Digest anchor
     if digest:

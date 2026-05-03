@@ -640,6 +640,10 @@ def _extract_jit_facts(
     )
     facts["category_slug"] = category_ctx.slug
 
+    conversation_history = getattr(merchant_ctx, "conversation_history", None)
+    if conversation_history:
+        facts["recent_conversation"] = merchant_ctx.conversation_history[-6:]
+
     # Digest anchor
     if digest:
         facts["digest_title"] = digest.get("title", "")
@@ -1149,11 +1153,11 @@ async def healthz():
 @app.get("/v1/metadata")
 async def metadata():
     return {
-        "team_name": "Antigravity",
-        "team_members": ["AI"],
+        "team_name": "SunChillFlower",
+        "team_members": ["Animesh Tripathi"],
         "model": "gemini-3.1-flash-lite-preview",
         "approach": "modular prompt template with suppression dedup",
-        "contact_email": "hello@example.com",
+        "contact_email": "AnimeshTripathi.who@gmail.com",
         "version": "1.0.0",
         "submitted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     }

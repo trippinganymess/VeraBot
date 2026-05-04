@@ -169,8 +169,3 @@ and submit `https://<your-host>` via the magicpin submission portal.
 - [x] `judge_simulator.py` runnable locally
 - [x] Container image runs as non-root, exposes a healthcheck
 
-## License / privacy
-
-The dataset is synthetic. The bot must not transmit payload data outside
-LLM provider APIs (per testing brief §11). State is wiped on
-`POST /v1/teardown` — the judge harness calls this at the end of a run.

@@ -353,7 +353,7 @@ class SemanticMatcher:
 
         ans = "neither"
         # Local import to avoid circular import at module load time.
-        from llm_pool import CLASSIFIER_CHAIN
+        from src.llm_pool import CLASSIFIER_CHAIN
 
         if CLASSIFIER_CHAIN.is_available():
             prompt = f'''Classify the following merchant message into EXACTLY ONE of \

@@ -1,4 +1,3 @@
-
 !README.md
 judge_simulator.py
 logs/
@@ -10,3 +9,5 @@ __pycache__/
 .githooks/
 dataset/
 .env
+.ruff_cache
+.vscode/

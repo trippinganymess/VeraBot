@@ -1251,8 +1251,7 @@ APP_VERSION = "1.0.0"
 # Multi-line description of the actual approach used by the bot. Kept as a
 # module-level constant so it's easy to update without touching the route.
 APPROACH_DESCRIPTION = (
-    "Hybrid deterministic-rule engine + multi-key Gemini LLM refinement with "
-    "model-level fallback. "
+    "Hybrid deterministic-rule engine "
     "Pipeline: (1) Pydantic validates the 4-context framework and enforces "
     "CTA position, voice/tone, code-mix, and offer-price hallucination guards. "
     "(2) A deterministic composer picks a strategy "

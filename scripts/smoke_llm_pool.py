@@ -50,7 +50,7 @@ if os.getenv("LIVE_LLM") != "1":
     sys.exit(0)
 
 # Load AFTER load_dotenv so env vars are picked up.
-from llm_pool import (  # noqa: E402
+from src.llm_pool import (  # noqa: E402
     CLASSIFIER_CHAIN,
     CLASSIFIER_MODELS,
     COMPOSER_CHAIN,

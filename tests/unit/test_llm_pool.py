@@ -13,7 +13,7 @@ from collections import Counter
 from typing import Any
 from unittest import mock
 
-from llm_pool import (
+from src.llm_pool import (
     GeminiKeyPool,
     ModelFallbackChain,
     _is_auth_error,

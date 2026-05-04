@@ -24,12 +24,12 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Literal, TypeVar
+from typing import Any, AsyncIterator, Literal, TypeVar
 
 import anyio
 from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from google.genai import types
 from pydantic import BaseModel, Field, ValidationInfo, model_validator
 
@@ -988,6 +988,32 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _sse_event(event: str, data: Any) -> str:
+    """Format a Server-Sent Event message with JSON payload."""
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _stream_single(event: str, data: Any) -> StreamingResponse:
+    """Stream a single SSE event (used for simple endpoints)."""
+    async def generator() -> AsyncIterator[str]:
+        yield _sse_event(event, data)
+        yield _sse_event("done", {"status": "ok"})
+
+    return StreamingResponse(generator(), media_type="text/event-stream")
+
+
+def _stream_actions(actions: list[dict[str, Any]]) -> StreamingResponse:
+    """Stream /v1/tick actions as SSE events."""
+    async def generator() -> AsyncIterator[str]:
+        yield _sse_event("start", {"count": len(actions)})
+        for action in actions:
+            yield _sse_event("action", action)
+        yield _sse_event("done", {"status": "ok"})
+
+    return StreamingResponse(generator(), media_type="text/event-stream")
+
+
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     """FastAPI lifespan: warm the semantic matcher once at startup.
@@ -998,7 +1024,7 @@ async def _lifespan(_: FastAPI):
     """
     logger.info("Eagerly loading semantic matcher anchors...")
     try:
-        semantic_matcher._ensure_loaded()
+        await anyio.to_thread.run_sync(semantic_matcher._ensure_loaded)
         logger.info("Semantic matcher ready.")
     except Exception:
         logger.exception("Semantic matcher warmup failed; continuing with regex fallback")
@@ -1008,7 +1034,7 @@ async def _lifespan(_: FastAPI):
 app = FastAPI(title="Vera Bot API", version="1.0.0", lifespan=_lifespan)
 
 @app.post("/v1/context")
-async def receive_context(push: ContextPush) -> Any:
+async def receive_context(push: ContextPush, stream: bool = False) -> Any:
     """Idempotently store a context push from the judge harness.
 
     A repeated POST with the same ``(scope, context_id, version)`` is a
@@ -1029,11 +1055,12 @@ async def receive_context(push: ContextPush) -> Any:
         current_version = store[push.context_id]["version"]
         if push.version <= current_version:
             if push.version == current_version:
-                return {
+                payload = {
                     "accepted": True,
                     "ack_id": f"ack_{uuid.uuid4().hex[:8]}",
                     "stored_at": _utc_now_iso(),
                 }
+                return _stream_single("context", payload) if stream else payload
             return JSONResponse(
                 status_code=409,
                 content={
@@ -1043,11 +1070,12 @@ async def receive_context(push: ContextPush) -> Any:
                 },
             )
     store[push.context_id] = {"version": push.version, "payload": push.payload}
-    return {
+    payload = {
         "accepted": True,
         "ack_id": f"ack_{uuid.uuid4().hex[:8]}",
         "stored_at": _utc_now_iso(),
     }
+    return _stream_single("context", payload) if stream else payload
 
 
 class TickRequest(BaseModel):
@@ -1061,7 +1089,7 @@ MAX_ACTIONS_PER_TICK = 20
 
 
 @app.post("/v1/tick")
-async def handle_tick(req: TickRequest) -> dict[str, Any]:
+async def handle_tick(req: TickRequest, stream: bool = False) -> Any:
     """Compose proactive actions for the active triggers (capped at 20)."""
     actions: list[dict[str, Any]] = []
     for trigger_id in req.available_triggers:
@@ -1118,7 +1146,8 @@ async def handle_tick(req: TickRequest) -> dict[str, Any]:
             "suppression_key": message["suppression_key"],
             "rationale": message["rationale"],
         })
-    return {"actions": actions}
+    payload = {"actions": actions}
+    return _stream_actions(actions) if stream else payload
 
 
 class ReplyRequest(BaseModel):
@@ -1134,7 +1163,7 @@ class ReplyRequest(BaseModel):
 
 
 @app.post("/v1/reply")
-async def handle_reply(req: ReplyRequest) -> dict[str, Any]:
+async def handle_reply(req: ReplyRequest, stream: bool = False) -> Any:
     """Route a merchant/customer reply to the right action.
 
     Decision pipeline:
@@ -1147,16 +1176,19 @@ async def handle_reply(req: ReplyRequest) -> dict[str, Any]:
         5. Anything else falls through to the deterministic+LLM composer.
     """
     if req.from_role != "merchant":
-        return {"action": "noop", "rationale": "Non-merchant message, no action needed"}
+        payload = {"action": "noop", "rationale": "Non-merchant message, no action needed"}
+        return _stream_single("reply", payload) if stream else payload
 
     merchant_data = _context_store["merchant"].get(req.merchant_id)
     if not merchant_data:
-        return {"action": "noop", "rationale": "Merchant context not found"}
+        payload = {"action": "noop", "rationale": "Merchant context not found"}
+        return _stream_single("reply", payload) if stream else payload
 
     intent_type = await _intent_type_async(req.message)
 
     if intent_type == "hostile":
-        return {"action": "end", "rationale": "Merchant is hostile; gracefully exiting"}
+        payload = {"action": "end", "rationale": "Merchant is hostile; gracefully exiting"}
+        return _stream_single("reply", payload) if stream else payload
 
     history = merchant_data["payload"].setdefault("conversation_history", [])
     history.append({"from": req.from_role, "body": req.message})
@@ -1167,25 +1199,29 @@ async def handle_reply(req: ReplyRequest) -> dict[str, Any]:
         if entry.get("from") == "merchant"
     ]
     if len(merchant_messages) >= 4 and len(set(merchant_messages[-4:])) == 1:
-        return {"action": "end", "rationale": "Auto-reply loop detected"}
+        payload = {"action": "end", "rationale": "Auto-reply loop detected"}
+        return _stream_single("reply", payload) if stream else payload
 
     if intent_type == "auto_reply":
-        return {"action": "end", "rationale": "Auto-responder detected; aborting"}
+        payload = {"action": "end", "rationale": "Auto-responder detected; aborting"}
+        return _stream_single("reply", payload) if stream else payload
 
     if intent_type == "wait":
-        return {
+        payload = {
             "action": "wait",
             "wait_seconds": 1800,
             "rationale": "Merchant needs time; backing off 30 minutes",
         }
+        return _stream_single("reply", payload) if stream else payload
 
     if intent_type == "intent_transition":
-        return {
+        payload = {
             "action": "send",
             "body": "Got it! Let's proceed with the details.",
             "cta": "open_ended",
             "rationale": "Acknowledged intent to proceed",
         }
+        return _stream_single("reply", payload) if stream else payload
 
     merchant_payload = merchant_data["payload"]
     category_slug = merchant_payload.get("category_slug", "unknown")
@@ -1214,30 +1250,33 @@ async def handle_reply(req: ReplyRequest) -> dict[str, Any]:
             },
             customer=customer_payload,
         )
-        return {
+        payload = {
             "action": "send",
             "body": composed["body"],
             "cta": composed["cta"],
             "rationale": composed["rationale"],
         }
+        return _stream_single("reply", payload) if stream else payload
     except Exception:
         logger.exception("compose_async failed in /v1/reply")
-        return {
+        payload = {
             "action": "send",
             "body": "Could you tell me a bit more?",
             "cta": "open_ended",
             "rationale": "compose_async error; generic fallback",
         }
+        return _stream_single("reply", payload) if stream else payload
 
 
 @app.get("/v1/healthz")
-async def healthz() -> dict[str, Any]:
+async def healthz(stream: bool = False) -> Any:
     """Liveness probe — uptime + counts of stored contexts per scope."""
-    return {
+    payload = {
         "status": "ok",
         "uptime_seconds": int(time.time() - START_TIME),
         "contexts_loaded": {scope: len(items) for scope, items in _context_store.items()},
     }
+    return _stream_single("healthz", payload) if stream else payload
 
 
 # Stable team identity — mirrored into /v1/metadata so the judge harness
@@ -1274,10 +1313,10 @@ APPROACH_DESCRIPTION = (
 
 
 @app.get("/v1/metadata")
-async def metadata() -> dict[str, Any]:
+async def metadata(stream: bool = False) -> Any:
     """Bot identity + a description of the architectural approach."""
     pool = get_pool()
-    return {
+    payload = {
         "team_name": TEAM_NAME,
         "team_members": TEAM_MEMBERS,
         "model": COMPOSER_MODELS[0] if COMPOSER_MODELS else "deterministic",
@@ -1288,10 +1327,11 @@ async def metadata() -> dict[str, Any]:
         "submitted_at": _utc_now_iso(),
         "llm_keys_configured": pool.size if pool else 0,
     }
+    return _stream_single("metadata", payload) if stream else payload
 
 
 @app.post("/v1/teardown")
-async def teardown() -> dict[str, Any]:
+async def teardown(stream: bool = False) -> Any:
     """Wipe all in-memory state. Called by the judge harness at test end."""
     for scope in _context_store:
         _context_store[scope].clear()
@@ -1299,7 +1339,8 @@ async def teardown() -> dict[str, Any]:
     pool = get_pool()
     if pool is not None:
         pool.reset_cooldowns()
-    return {"status": "ok", "message": "State wiped"}
+    payload = {"status": "ok", "message": "State wiped"}
+    return _stream_single("teardown", payload) if stream else payload
 
 
 if __name__ == "__main__":
